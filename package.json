@@ -1,0 +1,34 @@
+{
+  "name": "cgscaline",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0 <26"
+  },
+  "scripts": {
+    "dev": "node --max-semi-space-size=4 --import tsx src/cli.ts --color",
+    "demo": "node --max-semi-space-size=4 --import tsx src/cli.ts --demo --color",
+    "demo:en": "node --max-semi-space-size=4 --import tsx src/cli.ts --demo --en --color",
+    "start": "node --max-semi-space-size=4 dist/cgscaline.mjs --color",
+    "build": "tsc --noEmit && node scripts/build.mjs",
+    "build:exe": "tsc --noEmit && node scripts/build-exe.mjs",
+    "test": "tsx --test tests/*.test.ts",
+    "preview": "node --max-semi-space-size=4 --import tsx src/cli.ts --demo --preview --color",
+    "headless": "node --max-semi-space-size=4 dist/cgscaline.mjs --headless",
+    "status": "node --max-semi-space-size=4 dist/cgscaline.mjs --status",
+    "stop": "node --max-semi-space-size=4 dist/cgscaline.mjs --stop"
+  },
+  "dependencies": {
+    "undici": "7.30.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.19",
+    "esbuild": "0.28.2",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3"
+  },
+  "bin": {
+    "cgscaline": "dist/cgscaline.mjs"
+  }
+}
