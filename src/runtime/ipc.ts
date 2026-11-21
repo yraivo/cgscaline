@@ -3,7 +3,7 @@ import { createConnection, type Socket } from 'node:net';
 import { UserError, type State } from '../core/model.js';
 import type {AppState} from '../app/contracts.js';
 
-export const WORKER_BUILD_REV = '2026.11-r10';
+export const WORKER_BUILD_REV = '2026.11-r11';
 export interface WorkerAddress { version:1; pid:number; pipe:string; key:string; demo:boolean; startedAt:number; rev?:string }
 export interface Snapshot { revision:number; state:State|AppState; notices:string[];viewVersion?:2 }
 type Message = Record<string,any>;

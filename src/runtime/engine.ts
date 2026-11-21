@@ -264,7 +264,14 @@ export class Engine extends EventEmitter {
     this.store.state.settings.animationFps = resolveAnimationFps(this.store.state.settings.animationFps);
     this.store.state.settings.visualOpacity = resolveVisualOpacity(this.store.state.settings.visualOpacity);
     this.store.state.settings.schoolId ??= this.store.state.accounts.find(a => a.school.id)?.school.id ?? loadedProfile.profile.schoolId ?? '';
-    for (const a of this.store.state.accounts) if (a.session?.status === 'verified') a.session.status = 'saved';
+    for (const a of this.store.state.accounts) {
+      if (a.session?.status === 'verified') a.session.status = 'saved';
+      if (a.information && a.information.rulesSchemaVersion !== 2 && a.information.rules?.data?.some(r => r.faceAuth || r.dynamicWaypoints)) {
+        a.information.rules = { error: '尚未读取。' };
+        delete a.information.schoolFetchedAt;
+        a.information.rulesSchemaVersion = 2;
+      }
+    }
     this.hydrateRecordCache();
     for (const t of this.store.state.tasks) {
       if (t.phase === 'waiting' || t.phase === 'queued') { t.resumePhase = t.phase; t.phase = 'paused'; t.note = '任务已暂停，按 R 恢复。'; }
@@ -878,7 +885,7 @@ export class Engine extends EventEmitter {
         config: { baseUrl: a.school.baseUrl, token: s.token,
           secret: s.secret, signer: 'native', imei: deviceHeaders(a.device).imei, version: '', client: '',
           session: { ...deviceHeaders(a.device), v1: '', client: '' } },
-      }, { fetchImpl: taskFetch, allowedOrigins: new Set([new URL(BASE).origin]), audit: false });
+      }, { fetchImpl: taskFetch, allowedOrigins: new Set([new URL(BASE).origin, new URL(a.school.baseUrl).origin]), audit: false });
       let result = await runSubmit();
       if (!result.ok && stage === 'begin' && t.steps?.length === 1 && t.steps[0]?.endpoint === 'inSportTime' && t.steps[0]?.code === 2003) {
         await protocol.renew(a); await this.store.save(); result = await runSubmit();

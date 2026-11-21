@@ -3,7 +3,7 @@ import { mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promis
 import { dirname, resolve } from 'node:path';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { deviceConflicts } from '../core/device-identity.js';
-import { activeTask, BASE, identity, UserError, type Account, type Library, type State } from '../core/model.js';
+import { activeTask, identity, UserError, type Account, type Library, type State } from '../core/model.js';
 import type { Store } from './storage.js';
 
 const AAD = Buffer.from('CGSCALINE-BACKUP-V1', 'utf8');
@@ -198,6 +198,16 @@ export async function importPortableBackup(
   let accountsAdded = 0;
   let accountsUpdated = 0;
 
+  const isValidSchoolUrl = (u: unknown): u is string => {
+    if (typeof u !== 'string' || !u.endsWith('/')) return false;
+    try {
+      const parsed = new URL(u);
+      return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+    } catch {
+      return false;
+    }
+  };
+
   for (const incoming of payload.accounts) {
     if (
       !incoming ||
@@ -206,11 +216,11 @@ export async function importPortableBackup(
       !/^[a-zA-Z0-9_@.-]{2,80}$/.test(incoming.username) ||
       !incoming.device ||
       !/^[a-f\d]{16}$/i.test(incoming.device.androidId) ||
-      incoming.school?.baseUrl !== BASE
+      !isValidSchoolUrl(incoming.school?.baseUrl)
     ) {
       throw new UserError('备份包中含有非法账号档案，已中止导入。');
     }
-    const existing = stagedAccounts.find(a => a.username === incoming.username && a.school.baseUrl === BASE);
+    const existing = stagedAccounts.find(a => a.username === incoming.username && a.school.baseUrl === incoming.school.baseUrl);
     if (existing) {
       accountIdMap.set(incoming.id, existing.id);
       if ((!existing.session || existing.session.status === 'invalid') && incoming.session && incoming.session.xh === existing.username) {

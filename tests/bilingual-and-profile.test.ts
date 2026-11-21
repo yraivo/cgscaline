@@ -11,6 +11,7 @@ import { LocalAppClient } from '../src/app/local-client.js';
 import { demoFetch, seedDemo } from '../src/core/demo.js';
 import { Engine } from '../src/runtime/engine.js';
 import { cliLanguage, localizeBackendText } from '../src/core/i18n.js';
+import { identity } from '../src/core/model.js';
 import type { WorkerAddress } from '../src/runtime/ipc.js';
 import { searchSchools, normalizeSchoolServerUrl } from '../src/campus/school-directory.js';
 import { loadSchoolProfile } from '../src/campus/school-profile.js';
@@ -599,6 +600,107 @@ test('多校并存展示与防串台、二级菜单保持字标、弹窗不丢�
   const prepared = await engine.prepareDefault(demoAcc.id);
   assert.ok(prepared.previewWarnings?.some(w => w.includes('人脸核验')));
   assert.ok(prepared.previewWarnings?.some(w => w.includes('动态随机点位')));
+
+  await engine.shutdown();
+});
+
+test('回归：非默认高校域名真实任务提交放行（不误报 baseUrl 不在白名单），且 sportType=2 / authType=2 (GPS) 不误判为人脸识别', async () => {
+  const store = new Store(null);
+  const customBase = 'https://alpha-campus.example.edu.cn/cgapp-server/';
+  const engine = new Engine(store, async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname.endsWith('/sporttype')) {
+      return Response.json({
+        code: 200,
+        message: 'ok',
+        data: [
+          {
+            id: 27,
+            sportName: '阳光长跑',
+            sportType: 2,
+            authType: 2, // APK 中 authType=2 表示 GPS 感应（非人脸！）
+            openStartPointFace: 0,
+            openEndPointFace: 0,
+            isRandomWayPoint: 0,
+            vdistance: 3,
+            minVtime: '00:05:00',
+            maxVtime: '02:00:00',
+            isUseSensor: 1,
+            latlng: '30.550,103.990;30.550,104.010;30.565,104.010;30.565,103.990',
+            tips: '常规 GPS 跑',
+          },
+        ],
+      });
+    }
+    if (url.pathname.endsWith('/inSportTime')) {
+      return Response.json({ code: 200, message: 'ok', data: true });
+    }
+    if (url.pathname.endsWith('/sportsId')) {
+      return Response.json({ code: 200, message: 'ok', data: 'sp_alpha_9001' });
+    }
+    if (url.pathname.endsWith('/prejudgment')) {
+      return Response.json({ code: 200, message: 'ok', data: '' });
+    }
+    if (url.pathname.endsWith('/savesports')) {
+      return Response.json({
+        code: 200,
+        message: 'ok',
+        data: { sportId: 'sp_alpha_9001', isValid: '1', checkStatus: '1', inValidReason: '', tip: '有效' },
+      });
+    }
+    if (url.pathname.endsWith('/sensorZipFile')) {
+      return Response.json({ code: 200, message: 'ok', data: '1' });
+    }
+    return demoFetch(input, init);
+  });
+
+  await seedDemo(store);
+  const acc = store.state.accounts[0]!;
+  acc.school = {
+    id: '21',
+    name: '测试高校',
+    provinceCode: '51',
+    randomCode: '01',
+    baseUrl: customBase,
+  };
+  if (acc.session) acc.session.identity = identity(acc);
+  store.state.libraries[0]!.schoolBaseUrl = customBase;
+  // 模拟旧版误缓存的 faceAuth=true（无 rulesSchemaVersion=2），验证 initialize() 会自动清理旧误报缓存
+  acc.information = {
+    identity: acc.session!.identity,
+    sessionId: acc.session!.id,
+    fetchedAt: Date.now(),
+    schoolFetchedAt: Date.now(),
+    clock: { data: { serverMs: Date.now(), offsetMs: 0, rttMs: 10 } },
+    terms: { data: [] },
+    totals: { data: [] },
+    statistics: { error: '尚未读取。' },
+    rules: { data: [{ id: '27', name: '阳光长跑', minDuration: '00:05:00', maxDuration: '02:00:00', tips: '', faceAuth: true }] },
+    reasons: { data: [] },
+  };
+
+  await engine.initialize();
+  assert.equal(acc.information.rules.data, undefined, '旧版未带 rulesSchemaVersion=2 的误报缓存应在启动时自动失效');
+
+  await engine.schoolInformation(acc.id, true);
+  const freshRule = store.state.accounts[0]!.information?.rules.data?.[0];
+  assert.equal(freshRule?.id, '27');
+  assert.equal(freshRule?.faceAuth, undefined, 'sportType=2 且 authType=2 (GPS) 绝不能标记为人脸识别');
+  assert.equal(freshRule?.dynamicWaypoints, undefined);
+
+  const prepared = await engine.prepareDefault(acc.id);
+  assert.equal(prepared.previewWarnings, undefined);
+
+  // 执行完整两阶段真实任务提交（begin -> waiting -> commit），验证非默认 baseUrl 不再报「baseUrl 不在白名单」
+  const started = await engine.start(acc.id, prepared);
+  assert.equal(started.phase, 'waiting', `期望进入 waiting，实际 phase=${started.phase}, note=${started.note}`);
+  assert.equal(started.session?.sportId, 'sp_alpha_9001');
+
+  started.session!.endAtMs = Date.now() - 1000;
+  delete started.session!.commitAtLocalMs;
+  await engine.tick();
+  assert.equal(started.phase, 'done', `期望提交完成 done，实际 phase=${started.phase}, note=${started.note}`);
+  assert.equal(started.result?.businessValid, true);
 
   await engine.shutdown();
 });

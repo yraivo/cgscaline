@@ -33,6 +33,7 @@ export interface SchoolNotice {
 export interface AccountInformation {
   identity: string; sessionId: string; fetchedAt: number;
   schoolFetchedAt?: number;
+  rulesSchemaVersion?: number;
   noticesFetchedAt?: number;
   clock: ReadResult<{ serverMs: number; offsetMs: number; rttMs: number }>;
   terms: ReadResult<Term[]>; totals: ReadResult<Total[]>;
@@ -153,17 +154,25 @@ export async function fetchInformation(a: Account, fetcher: typeof fetch, scope:
   const rules = account ? previous?.rules ?? missing : await read('rules', v => array(v).slice(0, 100).map(x => {
     const r = object(x);
     const boundaryGcj02 = parseBoundaryString(r.latlng);
+    // APK 实证（FixedLineFragment.m1548 / FixedLinePrevActivity）：
+    // 1. 仅 sportType=5（定点路线跑）启用人脸识别与随机/必经打卡点；sportType=1/2（校园路跑/区域阳光跑）不走人脸。
+    // 2. authType=1 为途经点「人脸识别」，authType=2 为途经点「GPS 感应」（非人脸！）。
+    const sportTypeNum = number(r.sportType);
+    const isFixedLine = sportTypeNum === undefined || sportTypeNum === 5;
+    const pointList = Array.isArray(r.pointConfigList) ? r.pointConfigList : [];
+    const randomList = Array.isArray(r.randomPointConfigList) ? r.randomPointConfigList : [];
+    const dynamicWaypoints = isFixedLine && number(r.isRandomWayPoint) === 2;
+    const requiredCheckpoints = isFixedLine
+      ? pointList.filter(p => p && typeof p === 'object' && flag((p as Record<string, unknown>).isneedgo ?? (p as Record<string, unknown>).isNeedGo) === true).length
+      : 0;
     const startFace = flag(r.openStartPointFace) === true && flag(r.isSkipStartPointFace) !== true;
     const endFace = flag(r.openEndPointFace) === true && flag(r.isSkipEndPointFace) !== true;
-    const faceAuth = startFace || endFace || (number(r.authType) ?? 0) > 0;
-    const dynamicWaypoints = number(r.isRandomWayPoint) === 2;
-    const requiredCheckpoints = Array.isArray(r.pointConfigList)
-      ? r.pointConfigList.filter(p => p && typeof p === 'object' && flag((p as Record<string, unknown>).isneedgo ?? (p as Record<string, unknown>).isNeedGo) === true).length
-      : 0;
+    const waypointFace = number(r.authType) === 1 && flag(r.isSkipWayPointFace) !== true && (pointList.length > 0 || randomList.length > 0 || dynamicWaypoints);
+    const faceAuth = isFixedLine && (startFace || endFace || waypointFace);
     return {
       id: text(r.id), name: text(r.sportName), distanceKm: number(r.vdistance),
       minDuration: text(r.minVtime), maxDuration: text(r.maxVtime),
-      sensor: flag(r.isUseSensor), randomPoints: flag(r.isRandomWayPoint),
+      sensor: flag(r.isUseSensor), randomPoints: isFixedLine ? flag(r.isRandomWayPoint) : false,
       validCount: number(r.vcount), tips: text(r.tips),
       ...(boundaryGcj02 ? { boundaryGcj02 } : {}),
       ...(faceAuth ? { faceAuth: true } : {}),
@@ -178,6 +187,7 @@ export async function fetchInformation(a: Account, fetcher: typeof fetch, scope:
     sessionId: a.session?.id ?? '',
     fetchedAt: account ? Date.now() : previous?.fetchedAt ?? 0,
     schoolFetchedAt: account ? previous?.schoolFetchedAt : Date.now(),
+    rulesSchemaVersion: account ? previous?.rulesSchemaVersion : 2,
     ...(previous?.notices ? { noticesFetchedAt: previous.noticesFetchedAt, notices: previous.notices } : {}),
     clock,
     terms,
