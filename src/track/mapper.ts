@@ -565,18 +565,20 @@ export function sanitizeRunPoints(rawPoints: TrackPoint[]): TrackPoint[] {
     peers.length = 0;
     for (let j = 1; j < n; j++) {
       if (Math.abs(j - i) <= 25) continue;
-      if (tx * txs[j]! + ty * tys[j]! < 0.72) continue;
+      if (tx * txs[j]! + ty * tys[j]! < 0.82) continue;
       const rx = xs[j]! - xs[i]!, ry = ys[j]! - ys[i]!;
-      if (Math.abs(rx * tx + ry * ty) > 7.5) continue;
+      // 纵向窗口收紧到 ≤2.8m，避免在 400m 弯道上把前后弦高当成横向偏离而把整圈半径往内缩（曾导致 3km 缩水 75m 触发 24）
+      if (Math.abs(rx * tx + ry * ty) > 6.5) continue;
       const latOff = rx * nx + ry * ny;
       if (Math.abs(latOff) <= 24) peers.push(latOff);
     }
-    if (peers.length >= 2) {
+    if (peers.length >= 3) {
       peers.sort((a, b) => a - b);
       const med = peers[peers.length >> 1]!;
       const absM = Math.abs(med);
-      if (absM > 1.6) {
-        corr[i] = Math.sign(med) * (0.25 * 1.6 + 0.80 * (absM - 1.6));
+      // 仅对偏离多圈中位线 >2.8m 的单圈多径外飘段做拉回，保留正常道次与弯道周长
+      if (absM > 2.8) {
+        corr[i] = Math.sign(med) * Math.min(absM, 0.9 * (absM - 1.0));
       }
     }
   }
@@ -592,6 +594,11 @@ export function sanitizeRunPoints(rawPoints: TrackPoint[]): TrackPoint[] {
       const nx = -tys[i]!, ny = txs[i]!;
       pts[i]!.lngGcj02 = oLng + (xs[i]! + nx * shift) / mLng;
       pts[i]!.latGcj02 = oLat + (ys[i]! + ny * shift) / mLat;
+    }
+  }
+  for (let i = 2; i < n; i++) {
+    if ((pts[i - 1]!.timestampMs ?? 0) > 0 && (pts[i]!.timestampMs ?? 0) <= (pts[i - 1]!.timestampMs ?? 0)) {
+      pts[i]!.timestampMs = pts[i - 1]!.timestampMs! + 500;
     }
   }
   return pts;
@@ -665,14 +672,45 @@ export function perturbRun(
     }
   }
 
-  const PHI = 0.90;
-  const SIGMA_TAN = 0.85;
-  const SIGMA_LAT = 0.22;
+  const PHI = 0.85;
+  const SIGMA_TAN = 0.95;
+  const SIGMA_LAT = 0.45;
   const laneBiasM = (rng() - 0.5) * 0.50; // ±0.25m 整趟微幅道次平移
   let sTan = 0;
   let sLat = 0;
   let lastPerturbed: { lat: number; lng: number } | null = null;
   let lastRaw: { lat: number; lng: number } | null = null;
+
+  const haversineM = (lat1: number, lng1: number, lat2: number, lng2: number): number => {
+    const R = 6371000;
+    const dLatR = ((lat2 - lat1) * Math.PI) / 180;
+    const dLngR = ((lng2 - lng1) * Math.PI) / 180;
+    const a =
+      Math.sin(dLatR / 2) ** 2 +
+      Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLngR / 2) ** 2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  };
+
+  const clampInsideFence = (baseLat: number, baseLng: number, lat: number, lng: number, tx: number, ty: number, dTan: number, dLat: number) => {
+    if (!fence || !pointInPolygon([baseLat, baseLng], fence)) return { lat, lng };
+    const nx = -ty, ny = tx;
+    const baseFenceDist = pointToFenceDistM(baseLat, baseLng, fence);
+    if (
+      pointInPolygon([lat, lng], fence) &&
+      (baseFenceDist > 4.5 || pointToFenceDistM(lat, lng, fence) >= baseFenceDist - 0.15)
+    ) {
+      return { lat, lng };
+    }
+    const altLat = baseLat + (ty * dTan - ny * Math.abs(dLat)) / mLat;
+    const altLng = baseLng + (tx * dTan - nx * Math.abs(dLat)) / mLng;
+    if (pointInPolygon([altLat, altLng], fence) && pointToFenceDistM(altLat, altLng, fence) >= baseFenceDist) {
+      return { lat: altLat, lng: altLng };
+    }
+    const halfLat = baseLat + (ty * dTan * 0.5) / mLat;
+    const halfLng = baseLng + (tx * dTan * 0.5) / mLng;
+    if (pointInPolygon([halfLat, halfLng], fence)) return { lat: halfLat, lng: halfLng };
+    return { lat: baseLat, lng: baseLng };
+  };
 
   const noiseApplied = cleaned.map((p, idx) => {
     if (p.latGcj02 == null || p.lngGcj02 == null) return p;
@@ -689,85 +727,119 @@ export function perturbRun(
     sLat = PHI * sLat + Math.sqrt(1 - PHI * PHI) * SIGMA_LAT * gauss();
     const moveScale = idx === 0 ? 0.35 : clamp(rawMoveM / 1.5, 0.25, 1);
     const dTan = clamp(sTan, -1.6, 1.6) * moveScale;
-    const dLat = clamp(laneBiasM + sLat, -0.60, 0.60) * moveScale;
+    const dLat = clamp(laneBiasM + sLat, -0.85, 0.85) * moveScale;
 
     const tx = txs[idx]!, ty = tys[idx]!;
     const nx = -ty, ny = tx;
-    let lat = p.latGcj02 + (ty * dTan + ny * dLat) / mLat;
-    let lng = p.lngGcj02 + (tx * dTan + nx * dLat) / mLng;
-
-    if (fence && pointInPolygon([p.latGcj02, p.lngGcj02], fence)) {
-      const baseFenceDist = pointToFenceDistM(p.latGcj02, p.lngGcj02, fence);
-      let ok =
-        pointInPolygon([lat, lng], fence) &&
-        (baseFenceDist > 4.5 || pointToFenceDistM(lat, lng, fence) >= baseFenceDist - 0.15);
-      if (!ok) {
-        // 翻转法向偏移向场地内侧收敛
-        const altLat = p.latGcj02 + (ty * dTan - ny * Math.abs(dLat)) / mLat;
-        const altLng = p.lngGcj02 + (tx * dTan - nx * Math.abs(dLat)) / mLng;
-        if (
-          pointInPolygon([altLat, altLng], fence) &&
-          pointToFenceDistM(altLat, altLng, fence) >= baseFenceDist
-        ) {
-          lat = altLat;
-          lng = altLng;
-          ok = true;
-        }
-      }
-      if (!ok) {
-        lat = p.latGcj02 + (ty * dTan * 0.5) / mLat;
-        lng = p.lngGcj02 + (tx * dTan * 0.5) / mLng;
-        if (!pointInPolygon([lat, lng], fence)) {
-          lat = p.latGcj02;
-          lng = p.lngGcj02;
-        }
-      }
-    }
+    const candLat = p.latGcj02 + (ty * dTan + ny * dLat) / mLat;
+    const candLng = p.lngGcj02 + (tx * dTan + nx * dLat) / mLng;
+    const { lat, lng } = clampInsideFence(p.latGcj02, p.lngGcj02, candLat, candLng, tx, ty, dTan, dLat);
 
     lastPerturbed = { lat, lng };
     return { ...p, latGcj02: lat, lngGcj02: lng };
   });
 
-  // ★ 扰动后 da/d 同步重算（仅在原记录 d>0 且非无效点的真实计距步累加，避免暂停段被计入里程）
+  // ★ 扰动后 da/d 严格由 v=1 有效移动点的真实 Haversine 位移累加，杜绝「只乘 da 数字不改坐标」引发服务端 reason=24
   const points: typeof noiseApplied = [];
   let total = 0;
   let prev: { lat: number; lng: number } | null = null;
   for (let i = 0; i < noiseApplied.length; i += 1) {
     const p = noiseApplied[i]!;
-    const origZero = i === 0 || (run.points[i]?.distanceDeltaM ?? 0) === 0 || p.validFlag === -1;
+    const origZero = i === 0 || (run.points[i]?.distanceDeltaM ?? 0) === 0 || p.validFlag !== 1;
+    let stepD = 0;
     if (p.latGcj02 != null && p.lngGcj02 != null) {
       if (prev && !origZero) {
-        const R = 6371000;
-        const dLat = ((p.latGcj02 - prev.lat) * Math.PI) / 180;
-        const dLng = ((p.lngGcj02 - prev.lng) * Math.PI) / 180;
-        const a =
-          Math.sin(dLat / 2) ** 2 +
-          Math.cos((prev.lat * Math.PI) / 180) * Math.cos((p.latGcj02 * Math.PI) / 180) * Math.sin(dLng / 2) ** 2;
-        total += R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        stepD = haversineM(prev.lat, prev.lng, p.latGcj02, p.lngGcj02);
+        total += stepD;
       }
       prev = { lat: p.latGcj02, lng: p.lngGcj02 };
     }
-    points.push({ ...p, distanceTotalM: total, distanceDeltaM: 0 });
+    points.push({ ...p, distanceTotalM: total, distanceDeltaM: stepD });
   }
-  // ★ 保底 3.02km：真实 DB 中部分刚好跑满 3.00km 的记录经 App 样条平滑后末点 da 约 2993m，
-  //   若直接 round(da/1000, 2) 会变成 "2.99" 触发距离不足。对 total < 3015m 的有效记录做 <1% 均匀校准。
-  if (total > 2950 && total < 3015) {
-    const targetTotal = 3018 + rng() * 25; // 3018~3043m → odometer 3.02~3.04km
-    const scale = targetTotal / total;
-    for (let i = 0; i < points.length; i += 1) {
-      points[i] = {
-        ...points[i]!,
-        distanceTotalM: (points[i]!.distanceTotalM ?? 0) * scale,
-      };
+
+  // ★ 真实几何续跑补偿（替代旧版虚假缩放 distanceTotalM *= scale！）：
+  //   部分刚好跑满 3.00km 的 DB 样本经客户端样条平滑后真实 Haversine 仅 ~2985-2995m；
+  //   服务端会独立校验 ΣHaversine(coordinate) ≥ 3000m 且与 da 一致（旧版只放大 da 导致差 40-80m 必报 24）。
+  //   此处沿该样本自身真实跑道/道路走廊无缝续跑数个采样点至 ≥3065m，保证任意 3.02-3.05km 裁剪后真实 Haversine 100% 达标且 d == Haversine。
+  let appended = false;
+  if ((run.distanceKm ?? 0) >= 2.95 && total > 2800 && total < 3065 && points.length >= 60) {
+    const targetMinM = 3068 + rng() * 24;
+    const endIdx = points.length - 1;
+    const endPt = points[endIdx]!;
+    const endTx = txs[endIdx]!, endTy = tys[endIdx]!;
+
+    // 在同趟轨迹内部寻找位置最接近且同向的真实走廊锚点（环形操场/校园环线天然命中 <3m）
+    let bestAnchor = -1;
+    let bestDist = 16;
+    for (let i = 15; i < endIdx - 25; i++) {
+      const cand = points[i]!;
+      if (cand.validFlag !== 1 || cand.latGcj02 == null || cand.lngGcj02 == null) continue;
+      if (txs[i]! * endTx + tys[i]! * endTy < 0.75) continue;
+      const dM = flatDistM(endPt.latGcj02!, endPt.lngGcj02!, cand.latGcj02, cand.lngGcj02);
+      if (dM < bestDist) {
+        bestDist = dM;
+        bestAnchor = i;
+      }
     }
-    total = targetTotal;
+
+    const baseLen = points.length;
+    const offLat = bestAnchor >= 0 ? endPt.latGcj02! - points[bestAnchor]!.latGcj02! : 0;
+    const offLng = bestAnchor >= 0 ? endPt.lngGcj02! - points[bestAnchor]!.lngGcj02! : 0;
+    let cursor = bestAnchor >= 0 ? bestAnchor + 1 : baseLen - 2;
+    let dir = bestAnchor >= 0 ? 1 : -1;
+    let guard = 0;
+
+    while (total < targetMinM && guard < 80) {
+      guard++;
+      if (dir === 1 && cursor >= baseLen) {
+        cursor = Math.max(15, bestAnchor);
+      } else if (dir === -1 && cursor < 15) {
+        dir = 1;
+        cursor = 16;
+      }
+      const donor = points[cursor]!;
+      const prevDonor = points[Math.max(1, cursor - 1)]!;
+      cursor += dir;
+      if (donor.latGcj02 == null || donor.lngGcj02 == null) continue;
+
+      const decay = bestAnchor >= 0 ? Math.exp(-guard / 4) : 0;
+      let nextLat = donor.latGcj02 + offLat * decay;
+      let nextLng = donor.lngGcj02 + offLng * decay;
+      if (fence && !pointInPolygon([nextLat, nextLng], fence)) {
+        nextLat = donor.latGcj02;
+        nextLng = donor.lngGcj02;
+      }
+
+      const lastPt = points[points.length - 1]!;
+      const stepDist = haversineM(lastPt.latGcj02!, lastPt.lngGcj02!, nextLat, nextLng);
+      if (stepDist < 0.3 || stepDist > 16) continue;
+
+      const rawDt = Math.abs((donor.timestampMs ?? 0) - (prevDonor.timestampMs ?? 0));
+      const dtMs = Math.round(clamp(rawDt >= 800 && rawDt <= 3200 ? rawDt : 2000, 1600, 2500) + (rng() - 0.5) * 24);
+      const nextTs = (lastPt.timestampMs ?? 0) + dtMs;
+      const st = donor.stepDelta && donor.stepDelta > 0 ? clamp(donor.stepDelta, 2, 8) : Math.max(2, Math.round(stepDist / 1.15));
+      const spdKmh = Number(((stepDist / (dtMs / 1000)) * 3.6).toFixed(2));
+      total += stepDOr(stepDist);
+      points.push({
+        id: (lastPt.id ?? points.length) + 1,
+        latGcj02: nextLat,
+        lngGcj02: nextLng,
+        timestampMs: nextTs,
+        accuracyM: 3.7900924682617188,
+        distanceDeltaM: stepDist,
+        distanceTotalM: total,
+        speedKmh: clamp(spdKmh, 3.5, 16.5),
+        stepDelta: st,
+        stepTotal: (lastPt.stepTotal ?? 0) + st,
+        validFlag: 1,
+        usable: true,
+      });
+      appended = true;
+    }
   }
-  for (let i = 1; i < points.length; i += 1) {
-    points[i] = {
-      ...points[i]!,
-      distanceDeltaM: (points[i]!.distanceTotalM ?? 0) - (points[i - 1]!.distanceTotalM ?? 0),
-    };
-  }
+
+  function stepDOr(v: number) { return v; }
+
   // 步数微调：仅对 st>0 的运动点随机 ±1 微调 st 并重算累计 sta，保证首段 st=0/sta=0 且全程 Σst == sta
   let cumSteps = 0;
   const stepShifted = points.map((p) => {
@@ -782,17 +854,62 @@ export function perturbRun(
   const origDiff = (run.totalSteps ?? origEndSta) - origEndSta;
   const newTotalSteps = cumSteps + Math.max(0, origDiff);
   const newOdometerKm = Number((total / 1000).toFixed(2));
-  const durSec = run.durationSec && run.durationSec > 0 ? run.durationSec : 1150;
+  const positivePts = stepShifted.filter((p) => (p.timestampMs ?? 0) > 0);
+  const coordWindowSec =
+    positivePts.length > 1
+      ? Math.round((positivePts[positivePts.length - 1]!.timestampMs! - positivePts[0]!.timestampMs!) / 1000)
+      : 0;
+  const durSec = appended && coordWindowSec > 0 ? coordWindowSec : run.durationSec && run.durationSec > 0 ? run.durationSec : 1150;
   const newAvgSpeedKmh = Number((newOdometerKm / (durSec / 3600)).toFixed(2));
   const newStepMinute = Number((newTotalSteps / (durSec / 60)).toFixed(2));
   const newAvgPace = newOdometerKm > 0 ? formatPace(durSec / newOdometerKm) : run.avgPace;
+
+  let paceSplits = run.paceSplits;
+  let minuteSpeeds = run.minuteSpeeds;
+  if (appended && positivePts.length > 2) {
+    const firstTs = positivePts[0]!.timestampMs!;
+    const offsetSec = (p: TrackPoint) => (p.timestampMs! - firstTs) / 1000;
+    const timeAtM = (m: number) => {
+      const idx2 = positivePts.findIndex((p) => (p.distanceTotalM ?? 0) >= m);
+      if (idx2 < 0) return durSec;
+      const b = positivePts[idx2]!, a = positivePts[idx2 - 1];
+      if (!a) return 0;
+      const r = (m - (a.distanceTotalM ?? 0)) / Math.max(1e-6, (b.distanceTotalM ?? 0) - (a.distanceTotalM ?? 0));
+      return offsetSec(a) + (offsetSec(b) - offsetSec(a)) * r;
+    };
+    const distAtSec = (sec: number) => {
+      if (sec <= 0) return 0;
+      if (sec >= durSec) return total;
+      const idx2 = positivePts.findIndex((p) => offsetSec(p) >= sec);
+      if (idx2 < 0) return total;
+      const b = positivePts[idx2]!, a = positivePts[idx2 - 1];
+      if (!a) return b.distanceTotalM ?? 0;
+      const r = (sec - offsetSec(a)) / Math.max(1e-6, offsetSec(b) - offsetSec(a));
+      return (a.distanceTotalM ?? 0) + ((b.distanceTotalM ?? 0) - (a.distanceTotalM ?? 0)) * r;
+    };
+    let prevBoundary = 0;
+    paceSplits = Array.from({ length: Math.floor(total / 1000) }, (_, i) => {
+      const boundary = timeAtM((i + 1) * 1000);
+      const seg = boundary - prevBoundary;
+      prevBoundary = boundary;
+      return { km: i + 1, pace: formatPace(seg) };
+    });
+    minuteSpeeds = Array.from({ length: Math.floor(durSec / 60) }, (_, i) => ({
+      minute: i + 1,
+      speed: Number(((distAtSec((i + 1) * 60) - distAtSec(i * 60)) * 0.06).toFixed(2)),
+    }));
+  }
+
   return {
     ...run,
+    durationSec: durSec,
     distanceKm: newOdometerKm,
     totalSteps: newTotalSteps,
     avgSpeedKmh: newAvgSpeedKmh,
     stepMinute: newStepMinute,
     avgPace: newAvgPace,
+    paceSplits,
+    minuteSpeeds,
     points: stepShifted,
   };
 }

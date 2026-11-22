@@ -9,6 +9,7 @@ import { Engine } from '../src/runtime/engine.js';
 import { geometryErrors } from '../src/track/geometry.js';
 import { pointInPolygon, distanceMeters } from '../src/track/geo.js';
 import { perturbRun, replayRecordToUploadJsonSports } from '../src/track/mapper.js';
+import { fitRun } from '../src/track/fit.js';
 import type { GcjCoord, RunRecord, TrackPoint } from '../src/track/types.js';
 import { isCleanSourceRun, type LibraryData } from '../src/track/library.js';
 import { validateSaveJson } from '../src/protocol/validate.js';
@@ -301,4 +302,95 @@ test('修复 3：接入学校通知双接口（/activity + /notifications），�
 
   await ui.close();
   await client.close();
+});
+
+test('回归 reason=24：平滑后略低于 3000m 的 3km 样本经真实走廊续跑补足 Haversine ≥3015m，绝不虚假放大 da', () => {
+  // 构造一条模拟手机样条平滑后真实 Haversine ≈ 2982m（但标注 3.00km）的 8.4 圈田径场样本
+  const cLat = 31.20322, cLng = 121.40715;
+  const baseTs = 1762504860000;
+  const tilt = -0.26, cosT = Math.cos(tilt), sinT = Math.sin(tilt);
+  const pts: TrackPoint[] = [
+    { id: 0, latGcj02: cLat, lngGcj02: cLng, timestampMs: 0, accuracyM: 0, distanceDeltaM: 0, distanceTotalM: 0, speedKmh: 0, stepDelta: 0, stepTotal: 0, validFlag: 0, usable: false },
+  ];
+  let dist = 0, steps = 0;
+  const count = 560;
+  for (let k = 0; k < count; k++) {
+    const theta = (k / count) * Math.PI * 2 * 8.45;
+    const lx = 37 * Math.cos(theta), ly = 73 * Math.sin(theta);
+    const rx = lx * cosT - ly * sinT, ry = lx * sinT + ly * cosT;
+    const lat = cLat + ry / 111000;
+    const lng = cLng + rx / (111320 * Math.cos((cLat * Math.PI) / 180));
+    const d = k === 0 ? 0 : distanceMeters([pts.at(-1)!.latGcj02!, pts.at(-1)!.lngGcj02!], [lat, lng]);
+    dist += d;
+    const st = k === 0 ? 0 : 5;
+    steps += st;
+    pts.push({
+      id: k + 1,
+      latGcj02: lat,
+      lngGcj02: lng,
+      timestampMs: baseTs + (k + 1) * 2000,
+      accuracyM: 3.8,
+      distanceDeltaM: d,
+      distanceTotalM: dist,
+      speedKmh: d > 0 ? Number(((d / 2) * 3.6).toFixed(2)) : 0,
+      stepDelta: st,
+      stepTotal: steps,
+      validFlag: 1,
+      usable: true,
+    });
+  }
+  assert.ok(dist > 2940 && dist < 2999, `前置条件：原始几何总长应略低于 3000m，实际 ${dist.toFixed(1)}m`);
+  const durSec = Math.round((pts.at(-1)!.timestampMs! - pts[1]!.timestampMs!) / 1000);
+  const baseRun: RunRecord = {
+    id: 902,
+    sportId: 'short-smoothed-3k',
+    routeId: '27',
+    routeName: '2号田径场',
+    startDate: '2026-11-18 19:00:00',
+    endDate: '2026-11-18 19:18:40',
+    distanceKm: 3.0,
+    durationSec: durSec,
+    totalSteps: steps,
+    avgSpeedKmh: Number((3.0 / (durSec / 3600)).toFixed(2)),
+    avgPace: "06'13''",
+    stepMinute: Number((steps / (durSec / 60)).toFixed(2)),
+    statusEvidence: {},
+    points: pts,
+    paceSplits: [{ km: 1, pace: "06'13''" }, { km: 2, pace: "06'13''" }, { km: 3, pace: "06'13''" }],
+    minuteSpeeds: Array.from({ length: Math.floor(durSec / 60) }, (_, i) => ({ minute: i + 1, speed: 9.65 })),
+  };
+
+  for (let seed = 8101; seed <= 8115; seed++) {
+    const pert = perturbRun(baseRun, seed, SYNTH_STADIUM_27);
+    const fitted = fitRun(pert, { distanceKm: 3.02 }, 3.0);
+    const body = replayRecordToUploadJsonSports(fitted.run, { uid: '20240001' });
+    body.lastOdometerTime = fitted.lastOdometerTime;
+
+    const coords = body.coordinate ?? [];
+    let geoV1 = 0, geoDPos = 0;
+    for (let i = 1; i < coords.length; i++) {
+      const a = coords[i - 1]!, b = coords[i]!;
+      const step = distanceMeters([a.a, a.o], [b.a, b.o]);
+      if (b.v === 1) geoV1 += step;
+      if (b.d > 0) geoDPos += step;
+      assert.equal(pointInPolygon([b.a, b.o], SYNTH_STADIUM_27), true);
+    }
+    const daLast = coords.at(-1)!.da;
+    assert.ok(geoV1 >= 3015, `期望真实有效 Haversine ≥3015m，实际 ${geoV1.toFixed(1)}m`);
+    assert.ok(Math.abs(daLast - geoDPos) < 1.0, `期望 da 与真实 Haversine 零虚增（<1m），实际差 ${(daLast - geoDPos).toFixed(2)}m`);
+    assert.deepEqual(
+      geometryErrors({
+        body,
+        sensor: [],
+        routeId: '27',
+        libraryId: 'lib',
+        sourceRunId: baseRun.id,
+        sourceDistanceKm: 3.0,
+        seed,
+        durationSec: fitted.run.durationSec!,
+        sensorSource: 'generated',
+      }),
+      [],
+    );
+  }
 });

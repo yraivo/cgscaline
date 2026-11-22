@@ -7,17 +7,31 @@ function review(p: Prepared) {
   if (!points.length || points.some(v => ![v.a,v.o,v.t].every(Number.isFinite) || Math.abs(v.a)>90 || Math.abs(v.o)>180))
     errors.push('坐标或时间字段为空、非有限值或越界');
   let peak = 0;
+  let geoV1 = 0;
+  let geoDPos = 0;
   for (let i = 1; i < points.length; i++) {
     const a = points[i-1]!, b = points[i]!;
-    if (a.t > 0 && b.t > 0 && a.v === 1 && b.v === 1) {
-      const distance = distanceMeters([a.a,a.o], [b.a,b.o]), dt = b.t-a.t;
-      if (dt <= 0 && distance > 5) { errors.push('相同/逆序时间点存在明显位移'); break; }
-      if (dt > 0) peak = Math.max(peak, distance/dt*3600);
+    if ([a.a, a.o, b.a, b.o].every(Number.isFinite)) {
+      const stepDist = distanceMeters([a.a, a.o], [b.a, b.o]);
+      if (b.v === 1) geoV1 += stepDist;
+      if ((b.d ?? 0) > 0) geoDPos += stepDist;
+      if (a.t > 0 && b.t > 0 && a.v === 1 && b.v === 1) {
+        const dt = b.t - a.t;
+        if (dt <= 0 && stepDist > 5) { errors.push('相同/逆序时间点存在明显位移'); break; }
+        if (dt > 0) peak = Math.max(peak, stepDist / dt * 3600);
+      }
     }
   }
   if (peak > 50) warnings.push(`速度峰值 ${peak.toFixed(1)} km/h`);
   const km = Number(p.body.odometer);
   if (!Number.isFinite(km) || km<=0) errors.push('里程字段非法');
+  const daLast = points.at(-1)?.da ?? 0;
+  if (points.length >= 20 && daLast > 0 && daLast - geoDPos > 20) {
+    errors.push('累计里程高于坐标真实几何位移');
+  }
+  if (points.length >= 20 && km >= 3 && geoV1 < 3005) {
+    errors.push('有效轨迹坐标几何总长不足 3.00 km');
+  }
   if (p.sourceDistanceKm && Math.abs(km/p.sourceDistanceKm-1) > .15) errors.push('生成距离相对来源变化超过 15%');
   return { errors, warnings };
 }
