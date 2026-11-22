@@ -2,9 +2,8 @@ import { readFile, realpath, stat } from 'node:fs/promises';
 import { dirname, resolve, relative, isAbsolute } from 'node:path';
 import { randomInt, randomUUID } from 'node:crypto';
 import { loadAnySportSource, pullSportDatasetFromPhone, stripInputQuotes, type ExtractedAndroidSession } from '../campus/android-import.js';
-import { pointInPolygon } from './geo.js';
-import { perturbRun, replayRecordToUploadJsonSports, resolveRouteFence, sanitizeRunPoints } from './mapper.js';
-import type { Dataset, GcjCoord, RouteConfig, RunRecord } from './types.js';
+import { perturbRun, replayRecordToUploadJsonSports } from './mapper.js';
+import type { RouteConfig, RunRecord } from './types.js';
 import { alignBodyToNow } from '../protocol/align.js';
 import { generateSensor } from '../protocol/sensor.js';
 import { validateSaveJson } from '../protocol/validate.js';
@@ -15,44 +14,6 @@ import { fitRun, validateTargets, durationText } from './fit.js';
 export interface LibraryData { runs: RunRecord[]; sensors: Record<string, number[]>; routes?: RouteConfig[] }
 export { canUseLibrary as canUse } from '../core/model.js';
 import { canUseLibrary as canUse } from '../core/model.js';
-
-/** 识别清洗后仍存在暂停跨场跳变（>36m）、越出电子围栏或横穿田径场内场草坪的脏样本，在同路线有干净样本时自动排除。 */
-export function isCleanSourceRun(run: RunRecord, boundaryGcj02?: GcjCoord[]): boolean {
-  const cleaned = sanitizeRunPoints(run.points);
-  if (cleaned.length < 4) return false;
-  const fence = resolveRouteFence(cleaned, run.routeId, boundaryGcj02);
-  let sumLat = 0, sumLng = 0, cnt = 0;
-  for (let i = 0; i < cleaned.length; i++) {
-    const p = cleaned[i]!;
-    if (p.latGcj02 == null || p.lngGcj02 == null || !Number.isFinite(p.latGcj02) || !Number.isFinite(p.lngGcj02)) {
-      return false;
-    }
-    if (fence && !pointInPolygon([p.latGcj02, p.lngGcj02], fence)) return false;
-    if (i > 0) {
-      const a = cleaned[i - 1]!;
-      const dy = (p.latGcj02 - a.latGcj02!) * 111000;
-      const dx = (p.lngGcj02 - a.lngGcj02!) * 111320 * Math.cos(((p.latGcj02 + a.latGcj02!) * 0.5 * Math.PI) / 180);
-      if (Math.hypot(dx, dy) > 36) return false;
-    }
-    sumLat += p.latGcj02;
-    sumLng += p.lngGcj02;
-    cnt++;
-  }
-  // 标准 400m 田径场（轨迹外包半径 45m–135m）若轨迹穿过中心内场草坪（距中心 <26m），视为斜穿内场脏样本
-  if (cnt >= 100) {
-    const cLat = sumLat / cnt, cLng = sumLng / cnt;
-    const mLng = 111320 * Math.cos((cLat * Math.PI) / 180);
-    let maxR = 0, minR = Infinity;
-    for (let i = 0; i < cleaned.length; i++) {
-      const p = cleaned[i]!;
-      const rM = Math.hypot((p.latGcj02! - cLat) * 111000, (p.lngGcj02! - cLng) * mLng);
-      if (rM > maxR) maxR = rM;
-      if (rM < minR) minR = rM;
-    }
-    if (maxR > 45 && maxR < 135 && minR < 26) return false;
-  }
-  return true;
-}
 
 async function readJson(path: string) {
   if ((await stat(path)).size > 80_000_000) throw new UserError('导入文件超过 80MB。');
@@ -142,7 +103,7 @@ export async function importLibraryFromPhone(store: Store, label: string, scope:
   return { ...library, sourceHint };
 }
 
-export interface PrepareOptions extends OneShotTargets { runId?: number; seed?: number; avoidRunId?: number; avoidSeed?: number; mode?: 'auto' | 'legacy'; fallbackBoundary?: GcjCoord[] }
+export interface PrepareOptions extends OneShotTargets { runId?: number; seed?: number; avoidRunId?: number; avoidSeed?: number; mode?: 'auto' | 'legacy' }
 /** Auto and manual share the same statistics reconstruction. Legacy is diagnostic only. */
 export async function prepareOneShot(store: Store, a: Account, libraryId: string, options: PrepareOptions = {}): Promise<Prepared> {
   validateTargets(options);
@@ -150,30 +111,25 @@ export async function prepareOneShot(store: Store, a: Account, libraryId: string
   const library = store.state.libraries.find(l => l.id === libraryId);
   if (!library || !canUse(library, a)) throw new UserError('当前账号不能使用该记录库。');
   const data = await store.getLibrary<LibraryData>(libraryId);
-  const routeCfgBoundary = data.routes?.find(r => r.routeId === a.routeId)?.boundaryGcj02;
-  const boundary = routeCfgBoundary?.length ? routeCfgBoundary : options.fallbackBoundary;
   const sameRoute = data.runs.filter(r => r.routeId === a.routeId && (r.distanceKm ?? 0) >= 3 &&
     r.points.length >= 200 && r.points.every(p => Number.isFinite(p.latGcj02) && Number.isFinite(p.lngGcj02) &&
       Math.abs(p.latGcj02!) <= 90 && Math.abs(p.lngGcj02!) <= 180));
-  const cleanIds = new Set(sameRoute.filter(r => isCleanSourceRun(r, boundary)).map(r => r.id));
-  const cleanSameRoute = sameRoute.filter(r => cleanIds.has(r.id));
-  const effectiveSameRoute = options.runId !== undefined ? sameRoute : (cleanSameRoute.length ? cleanSameRoute : sameRoute);
-  const preferred = effectiveSameRoute.filter(r => (r.durationSec ?? 0) >= 840 && (r.durationSec ?? 0) <= 1800);
+  const preferred = sameRoute.filter(r => (r.durationSec ?? 0) >= 840 && (r.durationSec ?? 0) <= 1800);
   const targets: OneShotTargets = { ...(options.distanceKm === undefined ? {} : { distanceKm: options.distanceKm }), ...(options.durationSec === undefined ? {} : { durationSec: options.durationSec }) };
   const custom = options.distanceKm !== undefined || options.durationSec !== undefined;
   const reconstruct = custom || options.mode !== 'legacy';
-  let pool = custom ? sameRoute : preferred.length ? preferred : effectiveSameRoute;
+  let pool = custom ? sameRoute : preferred.length ? preferred : sameRoute;
   if (!pool.length) throw new UserError('该记录库没有符合条件的同路线样本。');
   if (options.runId !== undefined) { pool = pool.filter(r => r.id === options.runId); if (!pool.length) throw new UserError('诊断样本不在符合条件的同路线池中。'); }
   let seed = options.seed ?? randomInt(10_000, 100_000);
   if (options.seed === undefined && seed === options.avoidSeed) seed = seed === 99999 ? 10000 : seed + 1;
   let chosen: RunRecord, run: RunRecord, fitted: ReturnType<typeof fitRun> | undefined, candidateCount = pool.length;
   if (reconstruct) {
-    const candidates: Array<{ source: RunRecord; fit: ReturnType<typeof fitRun>; score: number; clean: boolean }> = [];
+    const candidates: Array<{ source: RunRecord; fit: ReturnType<typeof fitRun>; score: number }> = [];
     const failures = new Set<string>();
     for (const source of pool) {
       try {
-        const perturbed = perturbRun(source, seed, boundary);
+        const perturbed = perturbRun(source, seed);
         let actualTargets = targets;
         if (!custom) {
           const initial = fitRun(perturbed, {}, source.distanceKm!);
@@ -188,25 +144,25 @@ export async function prepareOneShot(store: Store, a: Account, libraryId: string
           actualTargets = { distanceKm, durationSec: Math.round(cropped.sourceWindowSec * (.94 + .12 * random())) };
         }
         const fit = fitRun(perturbed, actualTargets, source.distanceKm!);
-        candidates.push({ source, fit, clean: cleanIds.has(source.id), score: Math.abs(fit.timeScale - 1) + Math.abs(fit.run.points.length / source.points.length - 1) });
+        candidates.push({ source, fit, score: Math.abs(fit.timeScale - 1) + Math.abs(fit.run.points.length / source.points.length - 1) });
       } catch (error) { if (!(error instanceof UserError)) throw error; failures.add(error.message); }
     }
-    const cleanCandidates = candidates.filter(c => c.clean);
-    const activeCandidates = cleanCandidates.length ? cleanCandidates : candidates;
-    candidateCount = activeCandidates.length;
+    candidateCount = candidates.length;
     if (!candidateCount) {
       const distances = pool.map(r => r.distanceKm!), times = pool.map(r => r.durationSec ?? 0);
       throw new UserError(`没有支持此目标的同路线样本。来源 ${Math.min(...distances).toFixed(2)}–${Math.max(...distances).toFixed(2)} km / ${durationText(Math.min(...times))}–${durationText(Math.max(...times))}。${[...failures].slice(0, 2).join('；')}`);
     }
-    activeCandidates.sort((a, b) => a.score - b.score);
-    const near = custom ? activeCandidates.slice(0, 3) : activeCandidates, different = near.filter(c => c.source.id !== options.avoidRunId), choices = different.length ? different : near;
+    candidates.sort((a, b) => a.score - b.score);
+    const near = custom ? candidates.slice(0, 3) : candidates, different = near.filter(c => c.source.id !== options.avoidRunId), choices = different.length ? different : near;
     const selected = choices[randomInt(choices.length)]!; chosen = selected.source; fitted = selected.fit; run = fitted.run;
   } else {
     const different = pool.filter(r => r.id !== options.avoidRunId), choices = different.length ? different : pool;
-    chosen = choices[randomInt(choices.length)]!; run = perturbRun(chosen, seed, boundary);
+    chosen = choices[randomInt(choices.length)]!; run = perturbRun(chosen, seed);
   }
+  const ruleName = a.information?.rules.data?.find(r => r.id === a.routeId)?.name;
   const mapped = replayRecordToUploadJsonSports(run, {
     uid: a.session?.xh ?? a.username, name: a.session?.name ?? '', routeId: a.routeId,
+    ...(ruleName ? { planRouteName: ruleName } : {}),
     phoneVersion: phoneVersion(a.device),
   });
   if (fitted) mapped.lastOdometerTime = fitted.lastOdometerTime;

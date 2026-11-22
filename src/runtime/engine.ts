@@ -757,8 +757,7 @@ export class Engine extends EventEmitter {
   async prepare(id: string, libraryId: string, options: PrepareOptions = {}) {
     const a = this.account(id);
     const rule = a.information?.rules.data?.find(r => r.id === a.routeId);
-    const fallbackBoundary = rule?.boundaryGcj02 ?? this.profile.routes[a.routeId]?.boundaryGcj02;
-    const prepared = await prepareOneShot(this.store, a, libraryId, { ...options, ...(fallbackBoundary ? { fallbackBoundary } : {}) });
+    const prepared = await prepareOneShot(this.store, a, libraryId, options);
     if (rule) {
       const ruleWarns: string[] = [];
       if (rule.faceAuth) ruleWarns.push('该路线开启了人脸核验（当前不支持上传人脸照片，建议切换免刷脸路线）');

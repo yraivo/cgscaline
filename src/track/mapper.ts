@@ -13,8 +13,7 @@
  * 坐标系：所有坐标已是 GCJ-02，无需转换。
  */
 
-import type { GcjCoord, RouteTemplate, RunRecord, SyntheticTrack, TrackPoint } from "./types.js";
-import { pointInPolygon } from "./geo.js";
+import type { RouteTemplate, RunRecord, SyntheticTrack } from "./types.js";
 import type {
   Cpacestr,
   CminuteSpeedstr,
@@ -377,252 +376,14 @@ export function replayRecordToUploadJsonSports(
   };
 }
 
-function flatDistM(lat1: number, lng1: number, lat2: number, lng2: number): number {
-  const dy = (lat2 - lat1) * 111000;
-  const dx = (lng2 - lng1) * 111320 * Math.cos(((lat1 + lat2) * 0.5 * Math.PI) / 180);
-  return Math.hypot(dx, dy);
-}
-
-function pointToFenceDistM(lat: number, lng: number, fence: GcjCoord[]): number {
-  if (fence.length < 3) return Infinity;
-  const mLat = 111000;
-  const mLng = 111320 * Math.cos((lat * Math.PI) / 180);
-  let best = Infinity;
-  for (let i = 0; i < fence.length - 1; i++) {
-    const a = fence[i]!, b = fence[i + 1]!;
-    const ax = (a[1] - lng) * mLng, ay = (a[0] - lat) * mLat;
-    const bx = (b[1] - lng) * mLng, by = (b[0] - lat) * mLat;
-    const dx = bx - ax, dy = by - ay;
-    const lenSq = dx * dx + dy * dy;
-    const t = lenSq > 1e-9 ? Math.max(0, Math.min(1, -(ax * dx + ay * dy) / lenSq)) : 0;
-    const d = Math.hypot(ax + t * dx, ay + t * dy);
-    if (d < best) best = d;
-  }
-  return best;
-}
-
 /**
- * 清洗原始轨迹中的两类地图叠加以假乱真缺陷，并做多圈走廊中心收敛：
- * 1) 冷启动基站漂移（首段 t=0 / v=-1 / ac>30 落在宿舍楼墙里或河道中，导致手机端高德地图从墙里拉出红线）；
- * 2) 途中信号丢失尖峰（v=-1 / ac>32 / 超音速瞬移跳变穿墙过水后回到原路）；
- * 3) 多圈同向走廊横向外扩回归（将单圈多径反射偏到看台围墙或湖边的轨迹温和拉回真实跑道中心带）。
+ * ★ 2026-08-05 轨迹随机扰动：对重放的真实记录做物理扰动，绕过服务端"重复轨迹检测"。
+ *   - 坐标：±3-5m 低通相关噪声（真实 GPS 漂移形态，相邻点相关，非白噪声锯齿）
+ *   - 步数：sta 整体 ±20 偏移（st 增量不变，自洽；stepCount 同步偏移）
+ *   - 时间戳：不动（保持窗口/pace/activeTime 一致性；align 时统一重锚）
+ * 返回扰动后的记录副本（原记录不变）。
  */
-export function sanitizeRunPoints(rawPoints: TrackPoint[]): TrackPoint[] {
-  const pts = rawPoints.map((p) => ({ ...p }));
-  const n = pts.length;
-  if (n < 4) return pts;
-
-  const isReliable = (i: number) => {
-    const p = pts[i]!;
-    return (
-      i > 0 &&
-      p.validFlag === 1 &&
-      (p.accuracyM ?? 0) <= 28 &&
-      p.latGcj02 != null &&
-      p.lngGcj02 != null &&
-      Number.isFinite(p.latGcj02) &&
-      Number.isFinite(p.lngGcj02)
-    );
-  };
-
-  let firstClean = -1;
-  for (let i = 1; i < n; i++) {
-    if (!isReliable(i)) continue;
-    let nextClean = -1;
-    for (let j = i + 1; j < Math.min(n, i + 8); j++) {
-      if (isReliable(j)) {
-        nextClean = j;
-        break;
-      }
-    }
-    if (
-      nextClean < 0 ||
-      flatDistM(
-        pts[i]!.latGcj02!,
-        pts[i]!.lngGcj02!,
-        pts[nextClean]!.latGcj02!,
-        pts[nextClean]!.lngGcj02!,
-      ) <= 22
-    ) {
-      firstClean = i;
-      break;
-    }
-  }
-
-  if (firstClean > 0) {
-    const anchor = pts[firstClean]!;
-    for (let i = 0; i < firstClean; i++) {
-      const p = pts[i]!;
-      if (p.latGcj02 == null || p.lngGcj02 == null) continue;
-      if (
-        flatDistM(p.latGcj02, p.lngGcj02, anchor.latGcj02!, anchor.lngGcj02!) > 10 ||
-        p.validFlag === -1 ||
-        (p.accuracyM ?? 0) > 30
-      ) {
-        p.latGcj02 = anchor.latGcj02;
-        p.lngGcj02 = anchor.lngGcj02;
-        if (i > 0 && p.validFlag === -1) p.validFlag = 0;
-        if (i > 0 && (p.accuracyM ?? 0) > 15) p.accuracyM = 8.5;
-      }
-    }
-  }
-
-  const bad = new Uint8Array(n);
-  let lastClean = firstClean >= 0 ? firstClean : 0;
-  for (let i = Math.max(1, firstClean + 1); i < n; i++) {
-    const p = pts[i]!, prev = pts[lastClean]!;
-    if (p.latGcj02 == null || p.lngGcj02 == null || prev.latGcj02 == null || prev.lngGcj02 == null) continue;
-    const dStep = flatDistM(prev.latGcj02, prev.lngGcj02, p.latGcj02, p.lngGcj02);
-    const dtSec = Math.max(0.5, ((p.timestampMs ?? 0) - (prev.timestampMs ?? 0)) / 1000);
-    if (p.validFlag === -1 || (p.accuracyM ?? 0) > 32 || (dStep > 18 && dStep / dtSec > 8.2)) {
-      bad[i] = 1;
-    } else {
-      lastClean = i;
-    }
-  }
-
-  let idx = 1;
-  while (idx < n) {
-    if (!bad[idx]) {
-      idx++;
-      continue;
-    }
-    let end = idx;
-    while (end + 1 < n && bad[end + 1]) end++;
-    const left = idx - 1;
-    const right = end + 1 < n ? end + 1 : -1;
-    const a = pts[left]!;
-    if (
-      right > 0 &&
-      end - idx + 1 <= 16 &&
-      a.latGcj02 != null &&
-      a.lngGcj02 != null &&
-      pts[right]!.latGcj02 != null &&
-      pts[right]!.lngGcj02 != null &&
-      flatDistM(a.latGcj02, a.lngGcj02, pts[right]!.latGcj02!, pts[right]!.lngGcj02!) <= 45
-    ) {
-      const b = pts[right]!;
-      const tSpan = (b.timestampMs ?? 0) - (a.timestampMs ?? 0);
-      for (let k = idx; k <= end; k++) {
-        const pk = pts[k]!;
-        const r =
-          tSpan > 0 && (pk.timestampMs ?? 0) > 0
-            ? Math.max(0, Math.min(1, ((pk.timestampMs ?? 0) - (a.timestampMs ?? 0)) / tSpan))
-            : (k - left) / (right - left);
-        pk.latGcj02 = a.latGcj02 + (b.latGcj02! - a.latGcj02) * r;
-        pk.lngGcj02 = a.lngGcj02 + (b.lngGcj02! - a.lngGcj02) * r;
-        if (pk.validFlag === -1) pk.validFlag = (pk.distanceDeltaM ?? 0) > 0 ? 1 : 0;
-        if ((pk.accuracyM ?? 0) > 15) pk.accuracyM = 9.5;
-      }
-    } else if (right < 0 && a.latGcj02 != null && a.lngGcj02 != null) {
-      for (let k = idx; k <= end; k++) {
-        pts[k]!.latGcj02 = a.latGcj02;
-        pts[k]!.lngGcj02 = a.lngGcj02;
-        if (pts[k]!.validFlag === -1) pts[k]!.validFlag = 0;
-      }
-    }
-    idx = end + 1;
-  }
-
-  // 多趟走廊横向收敛：将偏离同向多圈中位线 >1.6m 的外飘段平滑拉回真实跑道/步道走廊
-  const oLat = pts[0]!.latGcj02 ?? 30.0;
-  const oLng = pts[0]!.lngGcj02 ?? 103.0;
-  const mLat = 111000;
-  const mLng = 111320 * Math.cos((oLat * Math.PI) / 180);
-  const xs = new Float64Array(n);
-  const ys = new Float64Array(n);
-  for (let i = 0; i < n; i++) {
-    xs[i] = ((pts[i]!.lngGcj02 ?? oLng) - oLng) * mLng;
-    ys[i] = ((pts[i]!.latGcj02 ?? oLat) - oLat) * mLat;
-  }
-  const txs = new Float64Array(n);
-  const tys = new Float64Array(n);
-  for (let i = 0; i < n; i++) {
-    const i0 = Math.max(0, i - 3), i1 = Math.min(n - 1, i + 3);
-    let dx = xs[i1]! - xs[i0]!, dy = ys[i1]! - ys[i0]!;
-    let len = Math.hypot(dx, dy);
-    if (len < 0.5 && i + 1 < n) {
-      dx = xs[i + 1]! - xs[i]!;
-      dy = ys[i + 1]! - ys[i]!;
-      len = Math.hypot(dx, dy);
-    }
-    if (len >= 1e-6) {
-      txs[i] = dx / len;
-      tys[i] = dy / len;
-    } else if (i > 0) {
-      txs[i] = txs[i - 1]!;
-      tys[i] = tys[i - 1]!;
-    } else {
-      txs[i] = 1;
-      tys[i] = 0;
-    }
-  }
-
-  const corr = new Float64Array(n);
-  const peers: number[] = [];
-  for (let i = 0; i < n; i++) {
-    const tx = txs[i]!, ty = tys[i]!, nx = -ty, ny = tx;
-    peers.length = 0;
-    for (let j = 1; j < n; j++) {
-      if (Math.abs(j - i) <= 25) continue;
-      if (tx * txs[j]! + ty * tys[j]! < 0.82) continue;
-      const rx = xs[j]! - xs[i]!, ry = ys[j]! - ys[i]!;
-      // 纵向窗口收紧到 ≤2.8m，避免在 400m 弯道上把前后弦高当成横向偏离而把整圈半径往内缩（曾导致 3km 缩水 75m 触发 24）
-      if (Math.abs(rx * tx + ry * ty) > 6.5) continue;
-      const latOff = rx * nx + ry * ny;
-      if (Math.abs(latOff) <= 24) peers.push(latOff);
-    }
-    if (peers.length >= 3) {
-      peers.sort((a, b) => a - b);
-      const med = peers[peers.length >> 1]!;
-      const absM = Math.abs(med);
-      // 仅对偏离多圈中位线 >2.8m 的单圈多径外飘段做拉回，保留正常道次与弯道周长
-      if (absM > 2.8) {
-        corr[i] = Math.sign(med) * Math.min(absM, 0.9 * (absM - 1.0));
-      }
-    }
-  }
-
-  for (let i = 0; i < n; i++) {
-    let sum = 0, cnt = 0;
-    for (let k = Math.max(0, i - 2); k <= Math.min(n - 1, i + 2); k++) {
-      sum += corr[k]!;
-      cnt++;
-    }
-    const shift = sum / cnt;
-    if (Math.abs(shift) > 1e-4 && pts[i]!.latGcj02 != null && pts[i]!.lngGcj02 != null) {
-      const nx = -tys[i]!, ny = txs[i]!;
-      pts[i]!.lngGcj02 = oLng + (xs[i]! + nx * shift) / mLng;
-      pts[i]!.latGcj02 = oLat + (ys[i]! + ny * shift) / mLat;
-    }
-  }
-  for (let i = 2; i < n; i++) {
-    if ((pts[i - 1]!.timestampMs ?? 0) > 0 && (pts[i]!.timestampMs ?? 0) <= (pts[i - 1]!.timestampMs ?? 0)) {
-      pts[i]!.timestampMs = pts[i - 1]!.timestampMs! + 500;
-    }
-  }
-  return pts;
-}
-
-export function resolveRouteFence(
-  _points: TrackPoint[],
-  _routeId?: string | null,
-  boundaryGcj02?: GcjCoord[],
-): GcjCoord[] | undefined {
-  return boundaryGcj02 && boundaryGcj02.length >= 3 ? boundaryGcj02 : undefined;
-}
-
-/**
- * ★ 走廊约束切向/法向物理微扰（Frenet-Frame Corridor-Constrained Perturbation）：
- *   1. 先清洗原始轨迹冷启动漂移、途中信号丢失尖峰与多圈外飘，并修复旧版 d=0 冻结导致的穿墙/过水直线弦；
- *   2. 沿运动切向（跑道/道路延伸方向）施加主随机微扰（±1.6m），法向（左右横跨跑道/河岸/墙壁方向）严格收敛在半条跑道内（±0.60m）；
- *   3. 自动结合场地电子围栏做内缩保护，绝不把点推向围栏外侧。
- */
-export function perturbRun(
-  run: RunRecord,
-  seed: number,
-  boundaryGcj02?: GcjCoord[],
-): RunRecord {
+export function perturbRun(run: RunRecord, seed: number): RunRecord {
   let state = seed >>> 0;
   const rng = () => {
     state = (state + 0x6d2b79f5) | 0;
@@ -635,211 +396,70 @@ export function perturbRun(
     const v = rng();
     return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
   };
-  const clamp = (v: number, lo: number, hi: number) => (v < lo ? lo : v > hi ? hi : v);
-
-  const cleaned = sanitizeRunPoints(run.points);
-  const n = cleaned.length;
-  const firstPt = cleaned.find((p) => p.latGcj02 != null && p.lngGcj02 != null);
-  const fence = resolveRouteFence(cleaned, run.routeId, boundaryGcj02);
-
-  const oLat = firstPt?.latGcj02 ?? 30.0;
-  const oLng = firstPt?.lngGcj02 ?? 103.0;
-  const mLat = 111000;
-  const mLng = 111320 * Math.cos((oLat * Math.PI) / 180);
-  const xs = cleaned.map((p) => ((p.lngGcj02 ?? oLng) - oLng) * mLng);
-  const ys = cleaned.map((p) => ((p.latGcj02 ?? oLat) - oLat) * mLat);
-
-  const txs = new Float64Array(n);
-  const tys = new Float64Array(n);
-  for (let i = 0; i < n; i++) {
-    const i0 = Math.max(0, i - 2), i1 = Math.min(n - 1, i + 2);
-    let dx = xs[i1]! - xs[i0]!, dy = ys[i1]! - ys[i0]!;
-    let len = Math.hypot(dx, dy);
-    if (len < 0.3 && i + 1 < n) {
-      dx = xs[i + 1]! - xs[i]!;
-      dy = ys[i + 1]! - ys[i]!;
-      len = Math.hypot(dx, dy);
-    }
-    if (len >= 1e-6) {
-      txs[i] = dx / len;
-      tys[i] = dy / len;
-    } else if (i > 0) {
-      txs[i] = txs[i - 1]!;
-      tys[i] = tys[i - 1]!;
-    } else {
-      txs[i] = 1;
-      tys[i] = 0;
-    }
-  }
-
+  // 低通相关噪声（AR(1) 均值回归 / Ornstein-Uhlenbeck：零漂移、相邻相关 0.85）。
+  //   ★ 不能用随机游走低通（0.72·nx+0.28·g）：游走累计漂移会让轨迹蜿蜒膨胀 ~12%
+  //   （实测 3044→3456m，odometer 与 pace 矛盾）；OU 过程噪声围绕 0 波动不漂移。
+  //   σ=1m：足够打破"精确重复比对"（起点/终点/点序列全变），da 变化 <2%
+  //   （实测 3044→~3090，落在真实记录 3.0-3.11km 分布内）。σ 过大（3m）膨胀 5.5% 过假。
+  let nx = 0;
+  let ny = 0;
   const PHI = 0.85;
-  const SIGMA_TAN = 0.95;
-  const SIGMA_LAT = 0.45;
-  const laneBiasM = (rng() - 0.5) * 0.50; // ±0.25m 整趟微幅道次平移
-  let sTan = 0;
-  let sLat = 0;
+  const SIGMA_M = 1;
   let lastPerturbed: { lat: number; lng: number } | null = null;
-  let lastRaw: { lat: number; lng: number } | null = null;
-
-  const haversineM = (lat1: number, lng1: number, lat2: number, lng2: number): number => {
-    const R = 6371000;
-    const dLatR = ((lat2 - lat1) * Math.PI) / 180;
-    const dLngR = ((lng2 - lng1) * Math.PI) / 180;
-    const a =
-      Math.sin(dLatR / 2) ** 2 +
-      Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLngR / 2) ** 2;
-    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  };
-
-  const clampInsideFence = (baseLat: number, baseLng: number, lat: number, lng: number, tx: number, ty: number, dTan: number, dLat: number) => {
-    if (!fence || !pointInPolygon([baseLat, baseLng], fence)) return { lat, lng };
-    const nx = -ty, ny = tx;
-    const baseFenceDist = pointToFenceDistM(baseLat, baseLng, fence);
-    if (
-      pointInPolygon([lat, lng], fence) &&
-      (baseFenceDist > 4.5 || pointToFenceDistM(lat, lng, fence) >= baseFenceDist - 0.15)
-    ) {
-      return { lat, lng };
-    }
-    const altLat = baseLat + (ty * dTan - ny * Math.abs(dLat)) / mLat;
-    const altLng = baseLng + (tx * dTan - nx * Math.abs(dLat)) / mLng;
-    if (pointInPolygon([altLat, altLng], fence) && pointToFenceDistM(altLat, altLng, fence) >= baseFenceDist) {
-      return { lat: altLat, lng: altLng };
-    }
-    const halfLat = baseLat + (ty * dTan * 0.5) / mLat;
-    const halfLng = baseLng + (tx * dTan * 0.5) / mLng;
-    if (pointInPolygon([halfLat, halfLng], fence)) return { lat: halfLat, lng: halfLng };
-    return { lat: baseLat, lng: baseLng };
-  };
-
-  const noiseApplied = cleaned.map((p, idx) => {
+  const noiseApplied = run.points.map((p, idx) => {
     if (p.latGcj02 == null || p.lngGcj02 == null) return p;
-    const rawMoveM =
-      idx > 0 && lastRaw ? flatDistM(lastRaw.lat, lastRaw.lng, p.latGcj02, p.lngGcj02) : Infinity;
-    lastRaw = { lat: p.latGcj02, lng: p.lngGcj02 };
-
-    // 仅当原坐标确实原地静止（<0.15m）时才复用上一点扰动坐标，彻底消除 d=0 移动段被冻结后穿墙拉直线的问题
-    if (idx > 0 && rawMoveM < 0.15 && lastPerturbed) {
+    // 保留原记录的静止点特征（d=0 或 v=-1 的点不与前一点产生虚假位移）
+    if (idx > 0 && ((p.distanceDeltaM ?? 0) === 0 || p.validFlag === -1) && lastPerturbed) {
       return { ...p, latGcj02: lastPerturbed.lat, lngGcj02: lastPerturbed.lng };
     }
-
-    sTan = PHI * sTan + Math.sqrt(1 - PHI * PHI) * SIGMA_TAN * gauss();
-    sLat = PHI * sLat + Math.sqrt(1 - PHI * PHI) * SIGMA_LAT * gauss();
-    const moveScale = idx === 0 ? 0.35 : clamp(rawMoveM / 1.5, 0.25, 1);
-    const dTan = clamp(sTan, -1.6, 1.6) * moveScale;
-    const dLat = clamp(laneBiasM + sLat, -0.85, 0.85) * moveScale;
-
-    const tx = txs[idx]!, ty = tys[idx]!;
-    const nx = -ty, ny = tx;
-    const candLat = p.latGcj02 + (ty * dTan + ny * dLat) / mLat;
-    const candLng = p.lngGcj02 + (tx * dTan + nx * dLat) / mLng;
-    const { lat, lng } = clampInsideFence(p.latGcj02, p.lngGcj02, candLat, candLng, tx, ty, dTan, dLat);
-
+    nx = PHI * nx + Math.sqrt(1 - PHI * PHI) * SIGMA_M * gauss();
+    ny = PHI * ny + Math.sqrt(1 - PHI * PHI) * SIGMA_M * gauss();
+    const lat = p.latGcj02 + nx / 111000;
+    const lng = p.lngGcj02 + ny / (111000 * Math.cos((p.latGcj02 * Math.PI) / 180));
     lastPerturbed = { lat, lng };
     return { ...p, latGcj02: lat, lngGcj02: lng };
   });
-
-  // ★ 扰动后 da/d 严格由 v=1 有效移动点的真实 Haversine 位移累加，杜绝「只乘 da 数字不改坐标」引发服务端 reason=24
+  // ★ 扰动后 da/d 必须同步重算：真实 da = App 坐标积分，坐标变 da 不变 → 位移 vs da 矛盾。
+  //   haversine 累计（首点 da=0），d = 相邻 da 差。
   const points: typeof noiseApplied = [];
   let total = 0;
   let prev: { lat: number; lng: number } | null = null;
   for (let i = 0; i < noiseApplied.length; i += 1) {
     const p = noiseApplied[i]!;
-    const origZero = i === 0 || (run.points[i]?.distanceDeltaM ?? 0) === 0 || p.validFlag !== 1;
-    let stepD = 0;
+    const origZero = i === 0 || (run.points[i]?.distanceDeltaM ?? 0) === 0 || p.validFlag === -1;
     if (p.latGcj02 != null && p.lngGcj02 != null) {
       if (prev && !origZero) {
-        stepD = haversineM(prev.lat, prev.lng, p.latGcj02, p.lngGcj02);
-        total += stepD;
+        const R = 6371000;
+        const dLat = ((p.latGcj02 - prev.lat) * Math.PI) / 180;
+        const dLng = ((p.lngGcj02 - prev.lng) * Math.PI) / 180;
+        const a =
+          Math.sin(dLat / 2) ** 2 +
+          Math.cos((prev.lat * Math.PI) / 180) * Math.cos((p.latGcj02 * Math.PI) / 180) * Math.sin(dLng / 2) ** 2;
+        total += R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
       }
       prev = { lat: p.latGcj02, lng: p.lngGcj02 };
     }
-    points.push({ ...p, distanceTotalM: total, distanceDeltaM: stepD });
+    points.push({ ...p, distanceTotalM: total, distanceDeltaM: 0 });
   }
-
-  // ★ 真实几何续跑补偿（替代旧版虚假缩放 distanceTotalM *= scale！）：
-  //   部分刚好跑满 3.00km 的 DB 样本经客户端样条平滑后真实 Haversine 仅 ~2985-2995m；
-  //   服务端会独立校验 ΣHaversine(coordinate) ≥ 3000m 且与 da 一致（旧版只放大 da 导致差 40-80m 必报 24）。
-  //   此处沿该样本自身真实跑道/道路走廊无缝续跑数个采样点至 ≥3065m，保证任意 3.02-3.05km 裁剪后真实 Haversine 100% 达标且 d == Haversine。
-  let appended = false;
-  if ((run.distanceKm ?? 0) >= 2.95 && total > 2800 && total < 3065 && points.length >= 60) {
-    const targetMinM = 3068 + rng() * 24;
-    const endIdx = points.length - 1;
-    const endPt = points[endIdx]!;
-    const endTx = txs[endIdx]!, endTy = tys[endIdx]!;
-
-    // 在同趟轨迹内部寻找位置最接近且同向的真实走廊锚点（环形操场/校园环线天然命中 <3m）
-    let bestAnchor = -1;
-    let bestDist = 16;
-    for (let i = 15; i < endIdx - 25; i++) {
-      const cand = points[i]!;
-      if (cand.validFlag !== 1 || cand.latGcj02 == null || cand.lngGcj02 == null) continue;
-      if (txs[i]! * endTx + tys[i]! * endTy < 0.75) continue;
-      const dM = flatDistM(endPt.latGcj02!, endPt.lngGcj02!, cand.latGcj02, cand.lngGcj02);
-      if (dM < bestDist) {
-        bestDist = dM;
-        bestAnchor = i;
-      }
+  // ★ 保底 3.02km：真实 DB 中部分刚好跑满 3.00km 的记录经 App 样条平滑后末点 da 约 2993m，
+  //   若直接 round(da/1000, 2) 会变成 "2.99" 触发距离不足。对 total < 3015m 的有效记录做 <1% 均匀校准。
+  if (total > 2950 && total < 3015) {
+    const targetTotal = 3018 + rng() * 25; // 3018~3043m → odometer 3.02~3.04km
+    const scale = targetTotal / total;
+    for (let i = 0; i < points.length; i += 1) {
+      points[i] = {
+        ...points[i]!,
+        distanceTotalM: (points[i]!.distanceTotalM ?? 0) * scale,
+      };
     }
-
-    const baseLen = points.length;
-    const offLat = bestAnchor >= 0 ? endPt.latGcj02! - points[bestAnchor]!.latGcj02! : 0;
-    const offLng = bestAnchor >= 0 ? endPt.lngGcj02! - points[bestAnchor]!.lngGcj02! : 0;
-    let cursor = bestAnchor >= 0 ? bestAnchor + 1 : baseLen - 2;
-    let dir = bestAnchor >= 0 ? 1 : -1;
-    let guard = 0;
-
-    while (total < targetMinM && guard < 80) {
-      guard++;
-      if (dir === 1 && cursor >= baseLen) {
-        cursor = Math.max(15, bestAnchor);
-      } else if (dir === -1 && cursor < 15) {
-        dir = 1;
-        cursor = 16;
-      }
-      const donor = points[cursor]!;
-      const prevDonor = points[Math.max(1, cursor - 1)]!;
-      cursor += dir;
-      if (donor.latGcj02 == null || donor.lngGcj02 == null) continue;
-
-      const decay = bestAnchor >= 0 ? Math.exp(-guard / 4) : 0;
-      let nextLat = donor.latGcj02 + offLat * decay;
-      let nextLng = donor.lngGcj02 + offLng * decay;
-      if (fence && !pointInPolygon([nextLat, nextLng], fence)) {
-        nextLat = donor.latGcj02;
-        nextLng = donor.lngGcj02;
-      }
-
-      const lastPt = points[points.length - 1]!;
-      const stepDist = haversineM(lastPt.latGcj02!, lastPt.lngGcj02!, nextLat, nextLng);
-      if (stepDist < 0.3 || stepDist > 16) continue;
-
-      const rawDt = Math.abs((donor.timestampMs ?? 0) - (prevDonor.timestampMs ?? 0));
-      const dtMs = Math.round(clamp(rawDt >= 800 && rawDt <= 3200 ? rawDt : 2000, 1600, 2500) + (rng() - 0.5) * 24);
-      const nextTs = (lastPt.timestampMs ?? 0) + dtMs;
-      const st = donor.stepDelta && donor.stepDelta > 0 ? clamp(donor.stepDelta, 2, 8) : Math.max(2, Math.round(stepDist / 1.15));
-      const spdKmh = Number(((stepDist / (dtMs / 1000)) * 3.6).toFixed(2));
-      total += stepDOr(stepDist);
-      points.push({
-        id: (lastPt.id ?? points.length) + 1,
-        latGcj02: nextLat,
-        lngGcj02: nextLng,
-        timestampMs: nextTs,
-        accuracyM: 3.7900924682617188,
-        distanceDeltaM: stepDist,
-        distanceTotalM: total,
-        speedKmh: clamp(spdKmh, 3.5, 16.5),
-        stepDelta: st,
-        stepTotal: (lastPt.stepTotal ?? 0) + st,
-        validFlag: 1,
-        usable: true,
-      });
-      appended = true;
-    }
+    total = targetTotal;
   }
-
-  function stepDOr(v: number) { return v; }
-
+  for (let i = 1; i < points.length; i += 1) {
+    points[i] = {
+      ...points[i]!,
+      distanceDeltaM: (points[i]!.distanceTotalM ?? 0) - (points[i - 1]!.distanceTotalM ?? 0),
+    };
+  }
   // 步数微调：仅对 st>0 的运动点随机 ±1 微调 st 并重算累计 sta，保证首段 st=0/sta=0 且全程 Σst == sta
   let cumSteps = 0;
   const stepShifted = points.map((p) => {
@@ -854,62 +474,17 @@ export function perturbRun(
   const origDiff = (run.totalSteps ?? origEndSta) - origEndSta;
   const newTotalSteps = cumSteps + Math.max(0, origDiff);
   const newOdometerKm = Number((total / 1000).toFixed(2));
-  const positivePts = stepShifted.filter((p) => (p.timestampMs ?? 0) > 0);
-  const coordWindowSec =
-    positivePts.length > 1
-      ? Math.round((positivePts[positivePts.length - 1]!.timestampMs! - positivePts[0]!.timestampMs!) / 1000)
-      : 0;
-  const durSec = appended && coordWindowSec > 0 ? coordWindowSec : run.durationSec && run.durationSec > 0 ? run.durationSec : 1150;
+  const durSec = run.durationSec && run.durationSec > 0 ? run.durationSec : 1150;
   const newAvgSpeedKmh = Number((newOdometerKm / (durSec / 3600)).toFixed(2));
   const newStepMinute = Number((newTotalSteps / (durSec / 60)).toFixed(2));
   const newAvgPace = newOdometerKm > 0 ? formatPace(durSec / newOdometerKm) : run.avgPace;
-
-  let paceSplits = run.paceSplits;
-  let minuteSpeeds = run.minuteSpeeds;
-  if (appended && positivePts.length > 2) {
-    const firstTs = positivePts[0]!.timestampMs!;
-    const offsetSec = (p: TrackPoint) => (p.timestampMs! - firstTs) / 1000;
-    const timeAtM = (m: number) => {
-      const idx2 = positivePts.findIndex((p) => (p.distanceTotalM ?? 0) >= m);
-      if (idx2 < 0) return durSec;
-      const b = positivePts[idx2]!, a = positivePts[idx2 - 1];
-      if (!a) return 0;
-      const r = (m - (a.distanceTotalM ?? 0)) / Math.max(1e-6, (b.distanceTotalM ?? 0) - (a.distanceTotalM ?? 0));
-      return offsetSec(a) + (offsetSec(b) - offsetSec(a)) * r;
-    };
-    const distAtSec = (sec: number) => {
-      if (sec <= 0) return 0;
-      if (sec >= durSec) return total;
-      const idx2 = positivePts.findIndex((p) => offsetSec(p) >= sec);
-      if (idx2 < 0) return total;
-      const b = positivePts[idx2]!, a = positivePts[idx2 - 1];
-      if (!a) return b.distanceTotalM ?? 0;
-      const r = (sec - offsetSec(a)) / Math.max(1e-6, offsetSec(b) - offsetSec(a));
-      return (a.distanceTotalM ?? 0) + ((b.distanceTotalM ?? 0) - (a.distanceTotalM ?? 0)) * r;
-    };
-    let prevBoundary = 0;
-    paceSplits = Array.from({ length: Math.floor(total / 1000) }, (_, i) => {
-      const boundary = timeAtM((i + 1) * 1000);
-      const seg = boundary - prevBoundary;
-      prevBoundary = boundary;
-      return { km: i + 1, pace: formatPace(seg) };
-    });
-    minuteSpeeds = Array.from({ length: Math.floor(durSec / 60) }, (_, i) => ({
-      minute: i + 1,
-      speed: Number(((distAtSec((i + 1) * 60) - distAtSec(i * 60)) * 0.06).toFixed(2)),
-    }));
-  }
-
   return {
     ...run,
-    durationSec: durSec,
     distanceKm: newOdometerKm,
     totalSteps: newTotalSteps,
     avgSpeedKmh: newAvgSpeedKmh,
     stepMinute: newStepMinute,
     avgPace: newAvgPace,
-    paceSplits,
-    minuteSpeeds,
     points: stepShifted,
   };
 }
