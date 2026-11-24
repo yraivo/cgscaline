@@ -14,7 +14,7 @@ async function fixture(override?:typeof fetch){
   const engine=new Engine(store,fetcher);await engine.initialize();await engine.checkSchool();calls.length=0;
   return{store,engine,calls,a:store.state.accounts[0]!,b:store.state.accounts[1]!};
 }
-test('账号概览四个 GET 与学校资料两个 GET 分开读取，保留学期边界和动态单位',async()=>{
+test('账号概览四个 GET 与学校资料三个 GET 分开读取，保留学期边界和动态单位',async()=>{
   const{engine,a,calls}=await fixture();const info=await engine.information(a.id,true);
   assert.equal(calls.length,4);assert.ok(calls.every(c=>c.method==='GET'));
   assert.ok(calls.every(c=>c.headers.get('cgAuthorization')===a.session!.token&&c.headers.get('imei')===deviceHeaders(a.device).imei));
@@ -23,7 +23,7 @@ test('账号概览四个 GET 与学校资料两个 GET 分开读取，保留学�
   assert.equal(stats.searchParams.get('xh'),a.username);assert.equal(stats.searchParams.get('validStatus'),'1');assert.equal(stats.searchParams.get('type'),'TERM');
   assert.equal(new Date(Number(stats.searchParams.get('endTime'))).toISOString(),'2027-01-22T15:59:59.000Z');
   assert.equal(info.statistics.data!.count,12);assert.equal(info.totals.data![0]!.unit,'次');assert.equal(info.rules.data,undefined);
-  const school=await engine.schoolInformation(a.id,true);assert.equal(calls.length,6);
+  const school=await engine.schoolInformation(a.id,true);assert.equal(calls.length,7);
   assert.equal(calls.find(c=>c.url.pathname.endsWith('/sporttype'))!.url.searchParams.get('uid'),a.username);assert.equal(school.rules.data![0]!.minDuration,'00:02:00');
   assert.ok(Number.isFinite(info.clock.data!.offsetMs));
   const saved=JSON.stringify(info);for(const credential of[a.session!.token,a.session!.secret])assert.equal(saved.includes(credential),false);
@@ -118,10 +118,10 @@ test('界面读取列表和指定详情缓存不触发接口，缓存绑定账�
 });
 test('学校页独立缓存与冷却，学校先读取不会伪造个人概览已刷新',async()=>{
   const{store,engine,a,calls}=await fixture();
-  const school=await engine.schoolInformation(a.id,true);assert.equal(calls.length,2);assert.equal(school.fetchedAt,0);assert.ok(school.schoolFetchedAt);
+  const school=await engine.schoolInformation(a.id,true);assert.equal(calls.length,3);assert.equal(school.fetchedAt,0);assert.ok(school.schoolFetchedAt);
   assert.ok(calls[0]!.url.pathname.endsWith('/sporttype'));assert.ok(calls[1]!.url.pathname.endsWith('/invalidconf'));
-  await engine.schoolInformation(a.id);assert.equal(calls.length,2);await assert.rejects(engine.schoolInformation(a.id,true),/60 秒/);
-  const personal=await engine.information(a.id,true);assert.equal(calls.length,6);assert.ok(personal.fetchedAt);assert.equal(personal.schoolFetchedAt,school.schoolFetchedAt);
+  await engine.schoolInformation(a.id);assert.equal(calls.length,3);await assert.rejects(engine.schoolInformation(a.id,true),/60 秒/);
+  const personal=await engine.information(a.id,true);assert.equal(calls.length,7);assert.ok(personal.fetchedAt);assert.equal(personal.schoolFetchedAt,school.schoolFetchedAt);
   const reopened=new Store(null);reopened.state=structuredClone(store.state);let reads=0;
   const e=new Engine(reopened,async()=>{reads++;throw Error('unexpected');});await e.initialize();await e.schoolInformation(a.id);assert.equal(reads,0);
   await assert.rejects(e.schoolInformation(a.id,true),/60 秒/);assert.equal(reads,0);
@@ -132,7 +132,7 @@ test('学校资料保持读取账号隔离，认证失效后结束两项读取�
     return demoFetch(input,init);
   });
   const one=await engine.schoolInformation(a.id,true),two=await engine.schoolInformation(b.id,true);
-  assert.equal(one.rules.data![0]!.name,a.username);assert.equal(two.rules.data![0]!.name,b.username);assert.equal(calls.length,4);
+  assert.equal(one.rules.data![0]!.name,a.username);assert.equal(two.rules.data![0]!.name,b.username);assert.equal(calls.length,6);
   const stopped=await fixture(async(input,init)=>String(input).includes('/sporttype')?Response.json({code:2003}):demoFetch(input,init));
   const info=await stopped.engine.schoolInformation(stopped.a.id,true);assert.equal(stopped.calls.length,1);assert.equal(info.rules.code,2003);assert.ok(info.reasons.error);
 });
@@ -140,7 +140,7 @@ test('学校资料保持读取账号隔离，认证失效后结束两项读取�
 test('缺失缓存不会隐式联网，过期缓存和重启只读；换身份或会话后拒绝复用',async()=>{
   const{engine,store,a,b,calls}=await fixture();
   await assert.rejects(engine.information(a.id),/按 R 刷新/);await assert.rejects(engine.schoolInformation(a.id),/按 R 刷新/);assert.equal(calls.length,0);
-  await engine.information(a.id,true);await engine.schoolInformation(a.id,true);assert.equal(calls.length,6);
+  await engine.information(a.id,true);await engine.schoolInformation(a.id,true);assert.equal(calls.length,7);
   a.information!.fetchedAt=a.information!.schoolFetchedAt=Date.now()-30*24*3600_000;
   const reopened=new Store(null);reopened.state=structuredClone(store.state);let reads=0;
   const e=new Engine(reopened,async()=>{reads++;throw Error('unexpected network');});await e.initialize();

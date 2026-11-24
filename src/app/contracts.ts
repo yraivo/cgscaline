@@ -5,6 +5,7 @@ import type {
   Account,
   ColorTheme,
   Compatibility,
+  Device,
   Language,
   Library,
   LogoFont,
@@ -21,12 +22,14 @@ import type { WorkoutRecord } from "../protocol/records.js";
 import type { SchoolDirectoryEntry } from "../campus/school-directory.js";
 
 export type AccountView = Readonly<Omit<Account, "session" | "recordCache">> & {
+  readonly profileIdentity?: string;
+  readonly deviceConflict?: boolean;
   readonly session?: Readonly<Omit<Session, "token" | "secret">>;
 };
 export interface PreparedSummary
   extends Omit<
     Prepared,
-    "body" | "sensor" | "sensorSampleCount" | "previewWarnings"
+    "body" | "sensor" | "preparedSessionId" | "sensorSampleCount" | "previewWarnings"
   > {
   kind: "summary";
   body: Readonly<Pick<Prepared["body"], "odometer" | "avgPace">>;
@@ -45,7 +48,7 @@ export type TaskView = Readonly<
   readonly prepared: PreparedSummary;
 };
 export type AppState = Readonly<
-  Omit<State, "accounts" | "tasks" | "settings" | "libraries">
+  Omit<State, "pendingBindings" | "accounts" | "tasks" | "settings" | "libraries">
 > & {
   readonly accounts: readonly AccountView[];
   readonly tasks: readonly TaskView[];
@@ -81,6 +84,19 @@ export type AccountChange = Partial<
     | "school"
   >
 >;
+export interface PhoneCandidateSummary {
+  libraryId: string;
+  username: string;
+  serverUrl: string;
+  schoolId?: string;
+  model: string;
+  displayAndroidId: string;
+  hasDevice: boolean;
+  hasSession: boolean;
+  matchedAccountId?: string;
+  sameDevice?: boolean;
+  accountUsed?: boolean;
+}
 export interface AppCommands {
   listSchools(): Promise<SchoolDirectoryEntry[]>;
   addAccount(
@@ -89,8 +105,12 @@ export interface AppCommands {
     school: string | SchoolDirectoryEntry,
     preset?: DevicePreset | "auto",
   ): Promise<AccountView>;
+  inspectDevice(id: string): Promise<{ device: Device; registered?: Device; revision?: number; conflict: boolean }>;
+  acceptRegisteredDevice(id: string, revision: number): Promise<void>;
+  inspectPhoneCandidate(libraryId: string): Promise<PhoneCandidateSummary | undefined>;
+  adoptPhoneCandidate(accountId: string, libraryId: string, restoreSession?: boolean): Promise<{ deviceChanged: boolean; sessionRestored: boolean }>;
+  stagePhoneCandidate(libraryId: string): Promise<void>;
   configure(id: string, change: AccountChange): Promise<void>;
-  regenerateDevice(id: string): Promise<{ imei: string; userAgent: string }>;
   configureAppearance(change: AppearanceChange): Promise<void>;
   setColorTheme(theme: ColorTheme): Promise<void>;
   configureSettings(change: {
@@ -181,7 +201,11 @@ export const commandNames = [
   "listSchools",
   "addAccount",
   "configure",
-  "regenerateDevice",
+  "inspectDevice",
+  "acceptRegisteredDevice",
+  "inspectPhoneCandidate",
+  "adoptPhoneCandidate",
+  "stagePhoneCandidate",
   "configureAppearance",
   "setColorTheme",
   "configureSettings",

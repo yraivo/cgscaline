@@ -5,8 +5,11 @@ import type { WorkoutRecord } from '../protocol/records.js';
 import { termPlanSummary } from '../runtime/scheduling.js';
 import { recordStatus } from './task-view.js';
 
-export { cachedInformation } from '../core/model.js';
-import { cachedInformation } from '../core/model.js';
+import { identity } from '../core/model.js';
+export function cachedInformation(a: AccountView) {
+  const info = a.information;
+  return info && info.sessionId === a.session?.id && info.identity === (a.profileIdentity ?? identity(a)) ? info : undefined;
+}
 
 export const dateTime = (ms: number) =>
   new Intl.DateTimeFormat('sv-SE', {

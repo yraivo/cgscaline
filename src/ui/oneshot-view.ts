@@ -20,6 +20,8 @@ export function oneShotLines(p: Prepared | PreparedSummary, lang: Language = 'zh
       '',
       `Source #${p.sourceRunId} · Pool ${p.candidateCount ?? '—'} · seed ${p.seed}`,
       `Original ${p.sourceDistanceKm?.toFixed(2) ?? '—'} km / ${p.sourceDurationSec === undefined ? '—' : durationText(p.sourceDurationSec)}`,
+      ...(p.rawGeometryCoverage ? [p.rawGeometryCoverage === 'partial' ? 'GPS distance excludes gaps' : 'No adjacent valid GPS fixes'] : []),
+      ...(p.rawGeometryMeters === undefined ? [] : [`Original GPS (adjacent valid fixes) ${Math.round(p.rawGeometryMeters)} m`]),
       `GNSS ${coordCnt} pts · ${p.sensorSource === 'recorded' ? 'Recorded IMU' : 'Synthesized IMU'} ${sensorCnt} pts`,
       ...(p.fit ? [`Cadence Scale ×${p.fit.timeScale.toFixed(3)}`] : []),
       `Auto-commit in ~${durationText(p.durationSec + 5)}`,
@@ -36,7 +38,9 @@ export function oneShotLines(p: Prepared | PreparedSummary, lang: Language = 'zh
         ]
       : []),
     '',
+    ...(p.rawGeometryCoverage ? [p.rawGeometryCoverage === 'partial' ? 'GPS 里程已排除缺测段' : '缺少相邻有效定位点'] : []),
     `来源 #${p.sourceRunId} · 可用 ${p.candidateCount ?? '—'} 条 · seed ${p.seed}`,
+    ...(p.rawGeometryMeters === undefined ? [] : [`原始 GPS（相邻有效点）${Math.round(p.rawGeometryMeters)} 米`]),
     `原记录 ${p.sourceDistanceKm?.toFixed(2) ?? '—'} km / ${p.sourceDurationSec === undefined ? '—' : durationText(p.sourceDurationSec)}`,
     `坐标 ${coordCnt} 点 · ${p.sensorSource === 'recorded' ? '历史传感器' : '生成传感器'} ${sensorCnt} 点`,
     ...(p.fit ? [`节奏 ×${p.fit.timeScale.toFixed(3)}`] : []),

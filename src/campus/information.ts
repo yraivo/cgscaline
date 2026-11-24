@@ -33,6 +33,7 @@ export interface SchoolNotice {
 export interface AccountInformation {
   identity: string; sessionId: string; fetchedAt: number;
   schoolFetchedAt?: number;
+  deviceLimits?: ReadResult<{ accountsPerDevice?: number; devicesPerAccount?: number; readAt: number }>;
   rulesSchemaVersion?: number;
   noticesFetchedAt?: number;
   clock: ReadResult<{ serverMs: number; offsetMs: number; rttMs: number }>;
@@ -46,7 +47,7 @@ export interface RecordDetail {
   sensorReturned: boolean; fields: string[]; minimap?: MinimapPoint[];
 }
 const paths = {
-  clock: 'api/l/v6/currentTimeMillis', terms: 'api/l/v6/termlist', totals: 'api/l/v6/termSportTotal',
+  config: 'api/l/v6/getConfig', clock: 'api/l/v6/currentTimeMillis', terms: 'api/l/v6/termlist', totals: 'api/l/v6/termSportTotal',
   statistics: 'api/l/v6/statistics', rules: 'api/l/v6/sporttype', reasons: 'api/l/v6.1/sports/invalidconf',
   detail: 'api/l/v7/sport/detail', activity: 'api/l/v6/activity', notifications: 'api/l/v6/notifications',
 } as const;
@@ -86,7 +87,7 @@ export async function readInformationEndpoint(
     query.set('beginTime', String(start)); query.set('endTime', String(end));
     query.set('validStatus', '1'); query.set('type', 'TERM');
   }
-  if (kind === 'rules') query.set('uid', s.xh);
+  if (kind === 'rules' || kind === 'config') query.set('uid', s.xh);
   if (kind === 'activity') query.set('page', '-1');
   if (kind === 'notifications') { query.set('page', '-1'); query.set('size', '-1'); }
   if (kind === 'detail') {
@@ -181,12 +182,21 @@ export async function fetchInformation(a: Account, fetcher: typeof fetch, scope:
     };
   }));
   const reasons = account ? previous?.reasons ?? missing : await read('reasons', v => array(v).slice(0, 100).map(x => { const r = object(x); return { code: text(r.code), reason: text(r.reason), description: text(r.reasonDes, 600) }; }));
+  const deviceLimits = account ? previous?.deviceLimits : await read('config', value => {
+    const data = object(value);
+    const limit = (raw: unknown) => {
+      const n = number(raw);
+      return n !== undefined && Number.isSafeInteger(n) && n >= 0 ? n : undefined;
+    };
+    return { accountsPerDevice: limit(data.app_imei_account), devicesPerAccount: limit(data.app_account_imei), readAt: Date.now() };
+  });
   if (a.session && a.session.status !== 'invalid' && !stopped && successfulReads > 0) a.session.status = 'verified';
   return {
     identity: identity(a),
     sessionId: a.session?.id ?? '',
     fetchedAt: account ? Date.now() : previous?.fetchedAt ?? 0,
     schoolFetchedAt: account ? previous?.schoolFetchedAt : Date.now(),
+    deviceLimits,
     rulesSchemaVersion: account ? previous?.rulesSchemaVersion : 2,
     ...(previous?.notices ? { noticesFetchedAt: previous.noticesFetchedAt, notices: previous.notices } : {}),
     clock,
@@ -341,6 +351,8 @@ export async function fetchSchoolNotices(a: Account, fetcher: typeof fetch): Pro
     sessionId: a.session?.id ?? '',
     fetchedAt: previous?.fetchedAt ?? 0,
     ...(previous?.schoolFetchedAt ? { schoolFetchedAt: previous.schoolFetchedAt } : {}),
+    deviceLimits: previous?.deviceLimits,
+    rulesSchemaVersion: previous?.rulesSchemaVersion,
     noticesFetchedAt: Date.now(),
     clock: previous?.clock ?? missing,
     terms: previous?.terms ?? missing,
@@ -364,7 +376,9 @@ export async function fetchNoticeArticle(a: Account, fetcher: typeof fetch, rawU
   }
   const baseOrigin = new URL(a.school.baseUrl);
   // 仅对同源 CGSport 服务端通知详情页附带鉴权头拉取正文；外部站点链接只展示原链接不透传凭据
-  if (parsed.hostname !== baseOrigin.hostname || !/^\/cgapp-server\/activity\/detail\/[\w-]+$/.test(parsed.pathname)) {
+  const detailPrefix = new URL('activity/detail/', baseOrigin).pathname;
+  const upgraded = parsed.protocol === 'http:' && baseOrigin.protocol === 'https:' && !parsed.port && !baseOrigin.port && parsed.hostname === baseOrigin.hostname;
+  if ((!upgraded && parsed.origin !== baseOrigin.origin) || parsed.username || parsed.password || !parsed.pathname.startsWith(detailPrefix) || !/^[\w-]+$/.test(parsed.pathname.slice(detailPrefix.length))) {
     return undefined;
   }
   const safeUrl = `${baseOrigin.protocol}//${baseOrigin.host}${parsed.pathname}`;

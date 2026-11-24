@@ -21,6 +21,8 @@ npm start -- --en  # launch TUI in English
 npm run build:exe  # bundle standalone release\cgscaline.exe
 ```
 
+Live vaults share `%LOCALAPPDATA%\CGSPORT\device-registry.dpapi` for the current Windows user. After upgrading, open your existing vault once to backfill registered devices before creating any custom `--data-dir` profile. Deleting an account retains its device binding, and encrypted portable backups transfer profiles across PCs (demo mode uses an in-memory registry). When importing an Android backup or pulling via ADB, you can optionally confirm syncing your physical phone profile and active session; any local binding conflict can be reviewed in Device Settings.
+
 To preview offline without an account, run `npm run demo:en` (or `cgscaline.exe --demo --en`).
 
 ## Getting Started

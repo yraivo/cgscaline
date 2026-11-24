@@ -2,8 +2,9 @@ import { createCipheriv, createDecipheriv, pbkdf2Sync, randomBytes, randomUUID }
 import { mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { gunzipSync, gzipSync } from 'node:zlib';
-import { deviceConflicts } from '../core/device-identity.js';
-import { activeTask, identity, UserError, type Account, type Library, type State } from '../core/model.js';
+import { accountKey, deviceConflicts, sameDevice, validDevice } from '../core/device-identity.js';
+import { activeTask, deviceUsage, migrateIdentity, identity, canUseLibrary, UserError, type Account, type Library, type State } from '../core/model.js';
+import { applyBinding, BindingConflict, commitBindings, type Bindings, type DeviceRegistry } from './device-registry.js';
 import type { Store } from './storage.js';
 
 const AAD = Buffer.from('CGSCALINE-BACKUP-V1', 'utf8');
@@ -41,6 +42,8 @@ export interface ImportBackupResult {
   accountsAdded: number;
   accountsUpdated: number;
   librariesAdded: number;
+  conflicts: string[];
+  sessionsSkipped: number;
 }
 
 function validatePassphrase(passphrase: string) {
@@ -69,6 +72,8 @@ export async function exportPortableBackup(
 
   const accounts = store.state.accounts.map(raw => {
     const copy = structuredClone(raw);
+    copy.deviceUsage = deviceUsage(copy);
+    delete copy.deviceRevision;
     delete copy.compatibility;
     if (!includeSessions) {
       delete copy.session;
@@ -129,6 +134,7 @@ export async function importPortableBackup(
   store: Store,
   filePath: string,
   passphrase: string,
+  registry: DeviceRegistry,
 ): Promise<ImportBackupResult> {
   validatePassphrase(passphrase);
   const trimmed = filePath.trim();
@@ -198,99 +204,124 @@ export async function importPortableBackup(
   let accountsAdded = 0;
   let accountsUpdated = 0;
 
-  const isValidSchoolUrl = (u: unknown): u is string => {
-    if (typeof u !== 'string' || !u.endsWith('/')) return false;
-    try {
-      const parsed = new URL(u);
-      return parsed.protocol === 'https:' || parsed.protocol === 'http:';
-    } catch {
-      return false;
+  const conflicts: string[] = [];
+  let sessionsSkipped = 0;
+  const keys = new Set<string>();
+  const ids = new Set<string>();
+  for (const incoming of payload.accounts) {
+    if (!incoming || typeof incoming.id !== 'string' || ids.has(incoming.id) ||
+      typeof incoming.username !== 'string' || !/^[a-zA-Z0-9_@.-]{2,80}$/.test(incoming.username) ||
+      !validDevice(incoming.device) || typeof incoming.school?.id !== 'string' ||
+      typeof incoming.school.baseUrl !== 'string' || !incoming.school.baseUrl.endsWith('/'))
+      throw new UserError('备份包中含有非法或重复账号档案。');
+    const key = accountKey(incoming);
+    if (keys.has(key)) throw new UserError('备份包中含有重复账号。');
+    keys.add(key); ids.add(incoming.id);
+    migrateIdentity(incoming);
+    incoming.deviceUsage = deviceUsage(incoming);
+    delete incoming.deviceRevision;
+    delete incoming.compatibility;
+    const session = incoming.session;
+    if (payload.includeSessions !== true || !session || !['verified', 'saved'].includes(session.status) ||
+      typeof session.id !== 'string' || !session.id || typeof session.token !== 'string' || !session.token ||
+      typeof session.secret !== 'string' || !session.secret || session.xh !== incoming.username || session.identity !== identity(incoming)) {
+      if (session) sessionsSkipped++;
+      delete incoming.session;
+      delete incoming.recordCache;
+      delete incoming.information;
+    } else {
+      session.status = 'saved';
+      for (const key of ['information', 'recordCache'] as const) {
+        const cache = incoming[key];
+        if (cache && (cache.identity !== session.identity || cache.sessionId !== session.id)) delete incoming[key];
+      }
+    }
+  }
+  const mergeAccounts = (entries: Bindings) => {
+    for (const incoming of payload.accounts) {
+      const existing = stagedAccounts.find(a => accountKey(a) === accountKey(incoming));
+      const target = existing ?? structuredClone(incoming);
+      if (existing) accountIdMap.set(incoming.id, existing.id);
+      else if (!/^[a-f0-9-]{36}$/.test(target.id) || stagedAccounts.some(a => a.id === target.id)) target.id = randomUUID();
+      try {
+        if (existing && existing.school.id !== incoming.school.id) throw new BindingConflict();
+        const same = sameDevice(target.device, incoming.device);
+        const others = stagedAccounts.filter(a => a !== target);
+        if (deviceConflicts({ ...target, device: incoming.device }, others).length) throw new BindingConflict();
+        let entry;
+        if (!existing) {
+          const known = entries.get(target);
+          if (known && !sameDevice(known.device, target.device)) throw new BindingConflict();
+          target.deviceSource = 'portable';
+          entry = entries.create(target);
+        } else if (!same) {
+          if (deviceUsage(existing) !== 'unused') throw new BindingConflict();
+          entry = entries.replace(existing, incoming.device, 'portable', true);
+          delete target.information; delete target.recordCache; delete target.compatibility;
+        } else entry = entries.verify(target);
+        if (incoming.deviceUsage === 'attempted') entry.usage = 'attempted';
+        else if (entry.usage === 'unused' && incoming.deviceUsage !== 'unused') entry.usage = 'unknown';
+        applyBinding(target, entry);
+        const canRestore = incoming.session && incoming.session.identity === identity(target) &&
+          (!existing?.session || existing.session.status === 'invalid');
+        if (canRestore) {
+          target.session = structuredClone(incoming.session);
+          target.information = structuredClone(incoming.information);
+          target.recordCache = structuredClone(incoming.recordCache);
+        } else if (incoming.session && (incoming.session.identity !== identity(target) || incoming.session.id !== target.session?.id)) sessionsSkipped++;
+        if (existing) { if (!same || canRestore) accountsUpdated++; }
+        else { stagedAccounts.push(target); accountIdMap.set(incoming.id, target.id); accountsAdded++; }
+      } catch (error) {
+        if (!(error instanceof BindingConflict)) throw error;
+        conflicts.push(incoming.id);
+        if (incoming.session) sessionsSkipped++;
+        accountIdMap.delete(incoming.id);
+      }
     }
   };
 
-  for (const incoming of payload.accounts) {
-    if (
-      !incoming ||
-      typeof incoming.id !== 'string' ||
-      typeof incoming.username !== 'string' ||
-      !/^[a-zA-Z0-9_@.-]{2,80}$/.test(incoming.username) ||
-      !incoming.device ||
-      !/^[a-f\d]{16}$/i.test(incoming.device.androidId) ||
-      !isValidSchoolUrl(incoming.school?.baseUrl)
-    ) {
-      throw new UserError('备份包中含有非法账号档案，已中止导入。');
-    }
-    const existing = stagedAccounts.find(a => a.username === incoming.username && a.school.baseUrl === incoming.school.baseUrl);
-    if (existing) {
-      accountIdMap.set(incoming.id, existing.id);
-      if ((!existing.session || existing.session.status === 'invalid') && incoming.session && incoming.session.xh === existing.username) {
-        const candidate: Account = { ...existing, device: structuredClone(incoming.device), proxy: incoming.proxy ?? existing.proxy };
-        if (deviceConflicts(candidate, stagedAccounts.filter(x => x.id !== existing.id)).length === 0) {
-          existing.device = candidate.device;
-          existing.proxy = candidate.proxy;
-          existing.session = { ...structuredClone(incoming.session), identity: identity(existing), status: 'saved' };
-          if (incoming.information) existing.information = { ...structuredClone(incoming.information), identity: identity(existing), sessionId: existing.session.id };
-          if (incoming.recordCache) existing.recordCache = { ...structuredClone(incoming.recordCache), identity: identity(existing), sessionId: existing.session.id };
-          accountsUpdated++;
-        }
-      }
-      continue;
-    }
-    const fresh: Account = structuredClone(incoming);
-    if (!/^[a-f0-9-]{36}$/.test(fresh.id) || stagedAccounts.some(a => a.id === fresh.id)) fresh.id = randomUUID();
-    accountIdMap.set(incoming.id, fresh.id);
-    fresh.device.androidId = fresh.device.androidId.toLowerCase();
-    if (deviceConflicts(fresh, stagedAccounts).length > 0)
-      throw new UserError(`备份中的账号 ${fresh.username} 与现有账号设备标识冲突，已中止导入。`);
-    if (fresh.session) {
-      if (fresh.session.xh !== fresh.username) delete fresh.session;
-      else {
-        fresh.session.identity = identity(fresh);
-        fresh.session.status = 'saved';
-      }
-    }
-    delete fresh.compatibility;
-    stagedAccounts.push(fresh);
-    accountsAdded++;
-  }
-
   let librariesAdded = 0;
   const stagedLibraries = [...store.state.libraries.map(l => structuredClone(l))];
+  const planned: Array<{ id: string; meta: Library; data: unknown }> = [];
   for (const item of payload.libraries) {
     const meta = item?.meta;
     if (!meta || typeof meta.id !== 'string' || !['private', 'public'].includes(meta.scope) || item.data === undefined) continue;
-    let libId = /^[a-f0-9-]{36}$/.test(meta.id) ? meta.id : randomUUID();
-    const mappedOwner = meta.scope === 'private' && meta.ownerAccountId ? (accountIdMap.get(meta.ownerAccountId) ?? meta.ownerAccountId) : undefined;
-    if (meta.scope === 'private' && (!mappedOwner || !stagedAccounts.some(a => a.id === mappedOwner))) continue;
-    if (stagedLibraries.some(l => l.id === libId)) continue;
-    const savedMeta: Library = {
-      id: libId,
-      label: String(meta.label ?? '导入记录库').slice(0, 60),
-      scope: meta.scope,
-      ...(mappedOwner ? { ownerAccountId: mappedOwner } : {}),
-      runCount: Number(meta.runCount) || 0,
-      routeIds: Array.isArray(meta.routeIds) ? meta.routeIds.map(String) : [],
-      importedAt: Number(meta.importedAt) || Date.now(),
-    };
-    await store.putLibrary(libId, item.data);
-    stagedLibraries.push(savedMeta);
-    librariesAdded++;
+    const id = /^[a-f0-9-]{36}$/.test(meta.id) ? meta.id : randomUUID();
+    if (stagedLibraries.some(l => l.id === id) || planned.some(l => l.id === id)) continue;
+    if (meta.scope === 'private' && (!meta.ownerAccountId || !ids.has(meta.ownerAccountId))) continue;
+    planned.push({ id, meta, data: item.data });
   }
 
-  for (const acc of stagedAccounts) {
-    if (acc.libraryId && !stagedLibraries.some(l => l.id === acc.libraryId)) {
-      const match = stagedLibraries.find(l => l.scope === acc.sourceMode && (l.scope === 'public' || l.ownerAccountId === acc.id));
-      acc.libraryId = match?.id;
+  await commitBindings(store, registry, mergeAccounts, async () => {
+    for (const { id, meta, data } of planned) {
+      const owner = meta.ownerAccountId && accountIdMap.get(meta.ownerAccountId);
+      if (meta.scope === 'private' && !owner) continue;
+      await store.putLibrary(id, data);
+      stagedLibraries.push({
+        id, label: String(meta.label ?? '导入记录库').slice(0, 60), scope: meta.scope,
+        ...(meta.scope === 'private' && owner ? { ownerAccountId: owner } : {}),
+        ...(typeof meta.schoolBaseUrl === 'string' ? { schoolBaseUrl: meta.schoolBaseUrl } : {}),
+        ...(typeof meta.schoolId === 'string' ? { schoolId: meta.schoolId } : {}),
+        ...(typeof meta.schoolName === 'string' ? { schoolName: meta.schoolName } : {}),
+        runCount: Number(meta.runCount) || 0, routeIds: Array.isArray(meta.routeIds) ? meta.routeIds.map(String) : [],
+        importedAt: Number(meta.importedAt) || Date.now(),
+      });
+      librariesAdded++;
     }
-  }
+    for (const acc of stagedAccounts) {
+      if (acc.libraryId && !stagedLibraries.some(l => l.id === acc.libraryId && canUseLibrary(l, acc))) {
+        const match = stagedLibraries.find(l => canUseLibrary(l, acc));
+        acc.libraryId = match?.id;
+      }
+    }
 
-  store.state.accounts = stagedAccounts;
-  store.state.libraries = stagedLibraries;
-  const s = store.state.settings;
-  if (!s.schoolId && payload.settings?.schoolId) s.schoolId = String(payload.settings.schoolId);
-  if (s.termTarget === undefined && typeof payload.settings?.termTarget === 'number' && payload.settings.termTarget > 0) {
-    s.termTarget = payload.settings.termTarget;
-  }
-  await store.save();
-  return { accountsAdded, accountsUpdated, librariesAdded };
+    store.state.accounts = stagedAccounts;
+    store.state.libraries = stagedLibraries;
+    const s = store.state.settings;
+    if (!s.schoolId && payload.settings?.schoolId) s.schoolId = String(payload.settings.schoolId);
+    if (s.termTarget === undefined && typeof payload.settings?.termTarget === 'number' && payload.settings.termTarget > 0) {
+      s.termTarget = payload.settings.termTarget;
+    }
+  });
+  return { accountsAdded, accountsUpdated, librariesAdded, conflicts, sessionsSkipped };
 }

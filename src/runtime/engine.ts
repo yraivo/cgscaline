@@ -10,6 +10,7 @@ import {
   compatibilityKey,
   deviceHeaders,
   identity,
+  migrateIdentity,
   newAccount,
   phoneVersion,
   safeText,
@@ -26,12 +27,19 @@ import {
 } from '../core/model.js';
 import { loadSchoolProfile, type SchoolProfile } from '../campus/school-profile.js';
 import { fetchSchoolDirectory, normalizeSchoolServerUrl, type SchoolDirectoryEntry } from '../campus/school-directory.js';
+import { applyBinding, BindingConflict, commitBindings, recoverBindings, MemoryDeviceRegistry, type DeviceRegistry } from './device-registry.js';
 import { Store } from './storage.js';
 import { Transport, validateProxy } from './transport.js';
 import { Protocol } from '../protocol/index.js';
 import { canUse, importLibrary, importLibraryFromPhone, prepareOneShot, type PrepareOptions } from '../track/library.js';
+import { parseJwtClaims, resolvePhoneDevice, type BackupHints, type BackupSessionHint } from '../campus/backup-snapshot.js';
+import type { PhoneCandidateSummary } from '../app/contracts.js';
+import { maskFixed } from '../core/privacy.js';
+import { NativeSigner } from '../protocol/signer.js';
+import { buildClient } from '../protocol/login.js';
+import { buildV1 } from '../protocol/device.js';
 import { assertGeometry } from '../track/geometry.js';
-import { allocateAndroidId, deviceConflicts, LEGACY_ANDROID_ID } from '../core/device-identity.js';
+import { accountKey, allocateAndroidId, deviceConflicts, sameDevice, validDevice } from '../core/device-identity.js';
 import { fetchInformation, fetchNoticeArticle, fetchRecordDetail, fetchSchoolNotices, type AccountInformation, type RecordDetail } from '../campus/information.js';
 import { recordActivity, requestName } from '../core/activity.js';
 import { isLogoFont, resolveFont, gradientSpeeds, resolveGradientSpeed } from '../render/logo-fonts.js';
@@ -50,6 +58,14 @@ interface AccountRecordCache {
   details: Map<string, RecordDetail>;
 }
 
+interface PhoneCandidate {
+  username: string;
+  serverUrl: string;
+  schoolId?: string;
+  device?: Device;
+  session?: BackupSessionHint;
+}
+
 export class Engine extends EventEmitter {
   readonly background: boolean = false;
   readonly connected: boolean = true;
@@ -57,16 +73,18 @@ export class Engine extends EventEmitter {
   private operations = new Set<string>();
   private armed = new Set<string>();
   private ticking = false;
+  private restoring = false;
   private planning = false;
   private checkingSchool?: Promise<void>;
   private recordCache = new Map<string, AccountRecordCache>();
+  private phoneCandidates = new Map<string, PhoneCandidate>();
   private informationAttempts = new Map<string, number>();
   private schoolAttempts = new Map<string, number>();
   private noticeAttempts = new Map<string, number>();
   private schoolProfile?: SchoolProfile;
   private schoolDirectoryCache?: { fetchedAt: number; list: SchoolDirectoryEntry[] };
   readonly startupNotices: string[] = [];
-  constructor(readonly store: Store, private mock?: typeof fetch) { super(); }
+  constructor(readonly store: Store, private mock?: typeof fetch, private registry: DeviceRegistry = new MemoryDeviceRegistry()) { super(); }
   private get profile(): SchoolProfile {
     if (!this.schoolProfile) this.schoolProfile = loadSchoolProfile(this.store.root).profile;
     return this.schoolProfile;
@@ -78,7 +96,8 @@ export class Engine extends EventEmitter {
     const old = this.clients.get(a.id), key = identity(a);
     if (old?.identity === key) return old.protocol;
     if (old) void old.transport.close();
-    const accountOrigin = new URL(a.school.baseUrl || BASE).origin;
+    const service = new URL(a.school.baseUrl || BASE);
+    const loginPath = new URL('api/f/v6/login', service).pathname;
     const transport = new Transport(a.proxy, this.mock, a.school.baseUrl), protocol = new Protocol(async (url, init) => {
       // 缓存的 client 也在每个请求边界复核身份；不能带旧 token 或新设备偷偷续用。
       if (this.account(a.id) !== a) throw new UserError('账号档案已被替换，请重新选择账号。');
@@ -86,13 +105,20 @@ export class Engine extends EventEmitter {
       if (identity(a) !== key) throw new UserError('账号设备或网络配置已变化，请重新操作。');
       const target = new URL(typeof url === 'string' ? url : url instanceof URL ? url.href : url.url);
       const headers = new Headers(init?.headers ?? (url instanceof Request ? url.headers : undefined));
-      if (target.origin === accountOrigin) {
+      if (target.origin === service.origin) {
+        if (!target.pathname.startsWith(service.pathname)) throw new UserError('请求超出账号服务路径。');
         const expected = deviceHeaders(a.device);
         if (headers.get('imei') !== expected.imei || headers.get('User-Agent') !== expected.userAgent)
           throw new UserError('请求设备标识与账号设置不匹配。');
-        if (!target.pathname.endsWith('/api/f/v6/login') && (!a.session || a.session.status === 'invalid' ||
+        if (target.pathname !== loginPath && (!a.session || a.session.status === 'invalid' ||
           a.session.identity !== key || a.session.xh !== a.username || headers.get('cgAuthorization') !== a.session.token))
           throw new UserError('登录信息与当前账号不匹配，请重新登录。');
+        if (target.pathname === loginPath && (!(init?.body instanceof URLSearchParams) ||
+          init.body.get('username') !== a.username)) throw new UserError('登录账号与当前档案不匹配。');
+        const binding = await this.registry.transaction(entries => entries.verify(a, true));
+        if (this.account(a.id) !== a || identity(a) !== key) throw new UserError('账号档案已变更，请重新操作。');
+        a.deviceUsage = binding.usage;
+        if (target.pathname !== loginPath && (a.session?.status === 'invalid' || a.session?.token !== headers.get('cgAuthorization'))) throw new UserError('会话已变更。');
       } else if (headers.has('cgAuthorization') || headers.has('imei') || headers.has('client'))
         throw new UserError('更新检查的请求配置有误。');
       const request = requestName(target.pathname);
@@ -105,7 +131,11 @@ export class Engine extends EventEmitter {
     this.clients.set(a.id, { identity: key, transport, protocol }); return protocol;
   }
   hasTask(id: string) { return this.store.state.tasks.some(t => t.accountId === id && activeTask(t)); }
-  async assertSession(id: string) { this.client(this.account(id)).session(this.account(id)); }
+  async assertSession(id: string) {
+    const a = this.account(id);
+    this.client(a).session(a);
+    await this.registry.transaction(table => table.verify(a));
+  }
   async configureSettings(change: { maxConcurrent?: number; notifications?: boolean; termTarget?: number }) {
     if (change.maxConcurrent !== undefined && (!Number.isInteger(change.maxConcurrent) || change.maxConcurrent < 1 || change.maxConcurrent > 16) ||
       change.notifications !== undefined && typeof change.notifications !== 'boolean' ||
@@ -154,17 +184,36 @@ export class Engine extends EventEmitter {
       await transport.close();
     }
   }
+  private recordPhoneHints(libraryId: string, hints?: BackupHints) {
+    this.phoneCandidates.delete(libraryId);
+    if (!hints?.username || !hints.serverUrl) return;
+    const device = resolvePhoneDevice(hints);
+    if (!device) return;
+    if (this.phoneCandidates.size >= 16) {
+      const oldest = this.phoneCandidates.keys().next().value;
+      if (oldest) this.phoneCandidates.delete(oldest);
+    }
+    this.phoneCandidates.set(libraryId, {
+      username: hints.username,
+      serverUrl: hints.serverUrl,
+      ...(hints.schoolId ? { schoolId: hints.schoolId } : {}),
+      device,
+      ...(hints.session ? { session: hints.session } : {}),
+    });
+  }
   async importLibrary(file: string, label: string, scope: Account['sourceMode'], owner?: string) {
-    const result = await importLibrary(this.store, file, label, scope, owner);
-    this.alignIdleAccountRoutes();
-    await this.store.save();
+    this.assertWritable();
+    let captured: BackupHints | undefined;
+    const result = await importLibrary(this.store, file, label, scope, owner, h => { captured = h; });
+    this.recordPhoneHints(result.id, captured);
     this.emit('change');
     return result;
   }
   async importLibraryFromPhone(label: string, scope: Account['sourceMode'], owner?: string) {
-    const result = await importLibraryFromPhone(this.store, label, scope, owner);
-    this.alignIdleAccountRoutes();
-    await this.store.save();
+    this.assertWritable();
+    let captured: BackupHints | undefined;
+    const result = await importLibraryFromPhone(this.store, label, scope, owner, h => { captured = h; });
+    this.recordPhoneHints(result.id, captured);
     this.emit('change');
     return result;
   }
@@ -174,6 +223,7 @@ export class Engine extends EventEmitter {
     if (this.store.state.tasks.some(t => activeTask(t) && t.prepared.libraryId === id)) {
       throw new UserError('有未结束任务正在使用该记录库，请先处理任务后再删除。');
     }
+    this.phoneCandidates.delete(id);
     this.store.state.libraries = this.store.state.libraries.filter(l => l.id !== id);
     for (const a of this.store.state.accounts) {
       if (a.libraryId === id) delete a.libraryId;
@@ -188,12 +238,19 @@ export class Engine extends EventEmitter {
   }
   async importBackup(filePath: string, passphrase: string) {
     if (this.operations.size || this.planning || this.ticking) throw new UserError('正在处理其他操作，请稍候再导入。');
-    const res = await importPortableBackup(this.store, filePath, passphrase);
-    this.hydrateRecordCache();
-    recordActivity(this.store.state, 'profile');
-    await this.store.save();
-    this.emit('change');
-    return res;
+    this.assertWritable();
+    this.restoring = true;
+    try {
+      const res = await importPortableBackup(this.store, filePath, passphrase, this.registry);
+      const clients = [...this.clients.values()];
+      this.clients.clear(); this.informationAttempts.clear(); this.schoolAttempts.clear(); this.noticeAttempts.clear();
+      await Promise.all(clients.map(c => c.transport.close()));
+      this.hydrateRecordCache();
+      recordActivity(this.store.state, 'profile');
+      await this.store.save();
+      this.emit('change');
+      return res;
+    } finally { this.restoring = false; }
   }
   async loadCachedRecords(id: string, sportId?: string | null, scope?: RecordScope | null) {
     const resolvedScope = scope ?? 'current';
@@ -219,7 +276,8 @@ export class Engine extends EventEmitter {
     await this.store.save(); this.emit('change'); return task.audit;
   }
   private assertUniqueDevice(a: Account) {
-    this.validateDevice(a.device);
+    if (this.store.state.pendingBindings) throw new UserError('设备绑定待恢复，请重新打开档案。');
+    if (!validDevice(a.device)) throw new UserError('设备字段格式错误。');
     const conflicts = deviceConflicts(a, this.store.state.accounts);
     if (conflicts.length) throw new UserError(`设备标识冲突：${a.label} 与 ${conflicts.map(v => v.label).join('、')} 重复。请在设置中更换设备标识后重新登录。`);
   }
@@ -245,6 +303,7 @@ export class Engine extends EventEmitter {
   }
   async initialize() {
     this.startupNotices.length = 0;
+    await recoverBindings(this.store, this.registry);
     const loadedProfile = loadSchoolProfile(this.store.root);
     this.schoolProfile = loadedProfile.profile;
     if (loadedProfile.fromDisk) {
@@ -265,6 +324,7 @@ export class Engine extends EventEmitter {
     this.store.state.settings.visualOpacity = resolveVisualOpacity(this.store.state.settings.visualOpacity);
     this.store.state.settings.schoolId ??= this.store.state.accounts.find(a => a.school.id)?.school.id ?? loadedProfile.profile.schoolId ?? '';
     for (const a of this.store.state.accounts) {
+      migrateIdentity(a, this.store.state.tasks);
       if (a.session?.status === 'verified') a.session.status = 'saved';
       if (a.information && a.information.rulesSchemaVersion !== 2 && a.information.rules?.data?.some(r => r.faceAuth || r.dynamicWaypoints)) {
         a.information.rules = { error: '尚未读取。' };
@@ -277,16 +337,20 @@ export class Engine extends EventEmitter {
       if (t.phase === 'waiting' || t.phase === 'queued') { t.resumePhase = t.phase; t.phase = 'paused'; t.note = '任务已暂停，按 R 恢复。'; }
       else if (t.phase === 'starting' || t.phase === 'committing') { t.phase = 'review'; t.note = '上次提交中断，按 C 查看结果。'; }
     }
-    for (const a of this.store.state.accounts) {
-      // 没有会话、没有待处理任务的旧空档案才允许自动补齐；不改动已登录身份。
-      if (!a.session && !this.hasTask(a.id) && (a.device.androidId.toLowerCase() === LEGACY_ANDROID_ID ||
-        deviceConflicts(a, this.store.state.accounts).length > 0)) {
-        a.device = { ...a.device, androidId: allocateAndroidId(this.store.state.accounts) };
-        this.startupNotices.push(`${a.label} 已分配独立设备标识，尚未登录。`);
-      }
+    if (this.store.state.accounts.length) {
+      const results = await this.registry.transaction(entries => {
+        for (const a of this.store.state.accounts) entries.observe(a);
+        return this.store.state.accounts.map(a => {
+          try { return entries.verify(a); }
+          catch (e) { if (e instanceof BindingConflict) return undefined; throw e; }
+        });
+      });
+      this.store.state.accounts.forEach((a, index) => {
+        const binding = results[index];
+        if (binding) applyBinding(a, binding);
+        else { a.bindingConflict = true; this.startupNotices.push(a.label + ' 设备标识冲突，请核对档案；原值已保留。'); }
+      });
     }
-    if (this.store.state.accounts.some(a => deviceConflicts(a, this.store.state.accounts).length))
-      this.startupNotices.push('设备标识重复，请在账号设置中更换。');
     recordActivity(this.store.state, 'startup', { count: this.store.state.accounts.length });
     const sessions = this.store.state.accounts.filter(a => a.session && a.session.status !== 'invalid' && a.session.identity === identity(a) && a.session.xh === a.username).length;
     if (sessions) recordActivity(this.store.state, 'sessions', { count: sessions });
@@ -316,6 +380,7 @@ export class Engine extends EventEmitter {
     recordActivity(this.store.state, change.colorTheme !== undefined ? 'theme' : 'appearance', { theme: change.colorTheme }); await this.store.save(); this.emit('change');
   }
   async addAccount(label: string, username: string, schoolInput: string | SchoolDirectoryEntry, preset: DevicePreset | 'auto' = 'auto') {
+    this.assertWritable();
     if (!label.trim() || !/^[a-zA-Z0-9_@.-]{2,80}$/.test(username)) throw new UserError('昵称不能为空，账号格式不正确。');
     const profile = this.profile;
     let resolvedSchool: Account['school'];
@@ -336,19 +401,33 @@ export class Engine extends EventEmitter {
         ...(schoolInput.loginUrl ? { loginUrl: schoolInput.loginUrl } : {}),
       };
     } else {
-      const existingSchool = this.store.state.accounts[0]?.school;
+      const existingSchool = this.store.state.settings.defaultSchool ?? this.store.state.accounts.find(a => a.school.id === (schoolInput || this.store.state.settings.schoolId))?.school ?? this.store.state.accounts[0]?.school;
       const resolvedSchoolId = (schoolInput || existingSchool?.id || profile.schoolId || '').trim();
       resolvedSchool = existingSchool && (!schoolInput || schoolInput.trim() === existingSchool.id)
         ? { ...existingSchool, id: resolvedSchoolId }
         : { id: resolvedSchoolId, provinceCode: profile.provinceCode, randomCode: profile.randomCode, baseUrl: profile.baseUrl };
     }
-    if (this.store.state.accounts.some(a => a.username === username && a.school.baseUrl === resolvedSchool.baseUrl)) {
+    if (this.store.state.accounts.some(a => accountKey(a) === accountKey({ username, school: resolvedSchool }))) {
       throw new UserError('该服务的账号已存在，请进入已有档案。');
     }
     if (preset !== 'auto' && !isDevicePreset(preset)) throw new UserError('设备预设无效。');
-    const a = newAccount(label.trim().slice(0, 40), username, resolvedSchool.id, profile);
-    a.school = resolvedSchool;
-    a.device = deviceFromPreset(preset === 'auto' ? selectDeviceProfile(this.store.state.accounts) : preset, allocateAndroidId(this.store.state.accounts));
+    const a = await this.registry.transaction(entries => {
+      const existing = entries.get({ username, school: resolvedSchool });
+      let device = existing?.device;
+      if (!device) {
+        const occupied = [...this.store.state.accounts, ...entries.entries.flatMap(e => [e.device, ...e.alternatives].map(device => ({ device })))];
+        device = deviceFromPreset(preset === 'auto' ? selectDeviceProfile(this.store.state.accounts) : preset, allocateAndroidId(occupied));
+      }
+      const account = newAccount(label.trim().slice(0, 40), username, resolvedSchool.id, profile, device);
+      account.school = resolvedSchool;
+      account.deviceUsage = existing?.usage ?? 'unused';
+      account.deviceSource = existing?.source ?? 'tui';
+      applyBinding(account, entries.create(account));
+      return account;
+    });
+    this.assertWritable();
+    if (this.store.state.accounts.some(other => accountKey(other) === accountKey(a))) throw new UserError('该服务的账号已存在。');
+    this.assertUniqueDevice(a);
     if (!this.store.state.accounts.length || !this.store.state.settings.schoolId) {
       this.store.state.settings.schoolId = resolvedSchool.id;
       if (resolvedSchool.name) this.store.state.settings.schoolName = resolvedSchool.name;
@@ -359,6 +438,141 @@ export class Engine extends EventEmitter {
     recordActivity(this.store.state, 'account-added', { accountId: a.id });
     await this.store.save();
     return a;
+  }
+  private assertWritable() {
+    if (this.restoring || this.store.state.pendingBindings) throw new UserError('设备绑定或备份恢复进行中，请稍后重试。');
+  }
+  async inspectDevice(id: string) {
+    const a = this.account(id);
+    return this.registry.transaction(entries => {
+      const entry = entries.get(a);
+      let conflict = false;
+      if (entry) {
+        try { entries.verify(a); } catch (e) { if (!(e instanceof BindingConflict)) throw e; conflict = true; }
+      }
+      return { device: structuredClone(a.device), registered: entry?.tenantId === a.school.id ? structuredClone(entry.device) : undefined, revision: entry?.version, conflict };
+    });
+  }
+  async acceptRegisteredDevice(id: string, revision: number) {
+    return this.exclusive(id, async () => {
+      const a = this.account(id);
+      if (this.hasTask(id)) throw new UserError('账号有未处理任务。');
+      await commitBindings(this.store, this.registry, table => table.acceptRegistered(a, revision), entry => {
+        this.assertUniqueDevice({ ...a, device: entry.device });
+        applyBinding(a, entry);
+        this.invalidateProfile(a);
+      });
+    });
+  }
+  async inspectPhoneCandidate(libraryId: string): Promise<PhoneCandidateSummary | undefined> {
+    const lib = this.store.state.libraries.find(l => l.id === libraryId);
+    const c = this.phoneCandidates.get(libraryId);
+    if (!lib || !c?.device) return undefined;
+    let matched: Account | undefined;
+    if (lib.scope === 'private') {
+      const owner = this.store.state.accounts.find(a => a.id === lib.ownerAccountId);
+      if (!owner || owner.username !== c.username || owner.school.baseUrl !== c.serverUrl ||
+        (c.schoolId && owner.school.id && c.schoolId !== owner.school.id)) return undefined;
+      matched = owner;
+    } else {
+      matched = this.store.state.accounts.find(a =>
+        a.username === c.username && a.school.baseUrl === c.serverUrl &&
+        (!c.schoolId || !a.school.id || c.schoolId === a.school.id),
+      );
+    }
+    if (deviceConflicts({ id: matched?.id ?? '', device: c.device }, this.store.state.accounts).length > 0) return undefined;
+    const priv = Boolean(this.store.state.settings.privacyMode);
+    const displayAndroidId = priv ? maskFixed(c.device.androidId, 16) : c.device.androidId;
+    const displayUser = priv ? maskFixed(c.username, Math.min(12, c.username.length)) : c.username;
+    const hasSession = Boolean(c.session && Number(c.session.loginOutTime) > Date.now());
+    return {
+      libraryId,
+      username: displayUser,
+      serverUrl: c.serverUrl,
+      ...(c.schoolId ? { schoolId: c.schoolId } : {}),
+      model: `${c.device.manufacturer} ${c.device.model}`,
+      displayAndroidId,
+      hasDevice: true,
+      hasSession,
+      ...(matched ? {
+        matchedAccountId: matched.id,
+        sameDevice: sameDevice(matched.device, c.device),
+        accountUsed: matched.deviceUsage !== 'unused',
+      } : {}),
+    };
+  }
+  async adoptPhoneCandidate(accountId: string, libraryId: string, restoreSession = true): Promise<{ deviceChanged: boolean; sessionRestored: boolean }> {
+    return this.exclusive(accountId, async () => {
+      const a = this.account(accountId);
+      if (this.hasTask(accountId)) throw new UserError('账号有未处理任务，请先处理后再同步真机档案。');
+      const lib = this.store.state.libraries.find(l => l.id === libraryId);
+      const c = this.phoneCandidates.get(libraryId);
+      if (!lib || !c?.device) throw new UserError('未找到可用的手机备份设备信息。');
+      if (lib.scope === 'private' && lib.ownerAccountId !== accountId) throw new UserError('私有记录库归属与目标账号不一致。');
+      if (a.username !== c.username || a.school.baseUrl !== c.serverUrl || (c.schoolId && a.school.id && c.schoolId !== a.school.id)) {
+        throw new UserError('手机备份归属（学校或学号）与当前账号不一致。');
+      }
+      this.assertUniqueDevice({ ...a, device: c.device });
+      const deviceChanged = !sameDevice(a.device, c.device);
+      await commitBindings(this.store, this.registry, entries => {
+        const entry = entries.replace(a, c.device!, 'phone');
+        entry.source = 'phone';
+        return entry;
+      }, binding => {
+        applyBinding(a, binding);
+        if (deviceChanged) this.invalidateProfile(a);
+      });
+      let sessionRestored = false;
+      if (restoreSession && c.session && Number(c.session.loginOutTime) > Date.now()) {
+        const claims = parseJwtClaims(c.session.token);
+        if (claims?.sub === a.username && (!claims.exp || claims.exp * 1000 > Date.now()) &&
+          (!claims.schoolId || !a.school.id || claims.schoolId === a.school.id)) {
+          a.session = {
+            id: randomUUID(),
+            token: c.session.token,
+            secret: c.session.secret,
+            loginOutTime: c.session.loginOutTime,
+            xh: a.username,
+            name: safeText(c.session.name ?? '', 40),
+            gender: c.session.gender === '2' ? '2' : '1',
+            identity: identity(a),
+            createdAt: Date.now(),
+            status: 'saved',
+          };
+          applyBinding(a, await this.registry.transaction(entries => entries.verify(a, true)));
+          a.information = undefined; a.recordCache = undefined;
+          this.recordCache.delete(accountId); this.informationAttempts.delete(accountId);
+          this.schoolAttempts.delete(accountId); this.noticeAttempts.delete(accountId);
+          try {
+            const protocol = this.client(a);
+            await this.preflight(a);
+            a.information = await fetchInformation(a, protocol.fetch, 'school');
+            this.schoolAttempts.set(accountId, Date.now());
+            this.alignIdleAccountRoutes();
+          } catch { /* best-effort prefetch */ }
+          recordActivity(this.store.state, 'session-saved', { accountId, level: 'ok' });
+          sessionRestored = true;
+        }
+      }
+      this.phoneCandidates.delete(libraryId);
+      recordActivity(this.store.state, 'profile', { accountId });
+      return { deviceChanged, sessionRestored };
+    });
+  }
+  async stagePhoneCandidate(libraryId: string): Promise<void> {
+    this.assertWritable();
+    const lib = this.store.state.libraries.find(l => l.id === libraryId);
+    const c = this.phoneCandidates.get(libraryId);
+    if (!lib || !c?.device) throw new UserError('未找到可登记的手机设备信息。');
+    const key = accountKey({ username: c.username, school: { id: c.schoolId ?? '', provinceCode: '', randomCode: '', baseUrl: c.serverUrl } });
+    if (this.store.state.accounts.some(a => accountKey(a) === key)) {
+      throw new UserError('该账号已存在，请直接同步到对应账号。');
+    }
+    if (deviceConflicts({ id: '', device: c.device }, this.store.state.accounts).length > 0) {
+      throw new UserError('该手机设备标识与现有账号冲突，无法登记。');
+    }
+    await this.registry.transaction(entries => entries.stagePhone(key, c.schoolId ?? '', c.device!));
+    this.phoneCandidates.delete(libraryId);
   }
   async configure(id: string, change: Partial<Pick<Account, 'label' | 'libraryId' | 'device' | 'proxy' | 'routeId' | 'sourceMode' | 'school'>>) {
     const allowed = new Set(['label', 'libraryId', 'device', 'proxy', 'routeId', 'sourceMode', 'school']);
@@ -373,28 +587,53 @@ export class Engine extends EventEmitter {
       if (!normalized) throw new UserError('学校服务地址无效。');
       change.school = { ...change.school, baseUrl: normalized };
     }
-    if (change.device) {
-      change.device = { ...change.device, androidId: change.device.androidId.toLowerCase() };
-      this.validateDevice(change.device);
-      this.assertUniqueDevice({ ...a, device: change.device });
-    }
-    Object.assign(a, change);
-    if (identity(a) !== oldIdentity) { if (a.session) a.session.status = 'invalid'; a.compatibility = undefined; a.information = undefined; a.recordCache = undefined; this.recordCache.delete(id); this.informationAttempts.delete(id); this.schoolAttempts.delete(id); this.noticeAttempts.delete(id); }
-    recordActivity(this.store.state, 'profile', { accountId: id });
-    await this.store.save();
+    const target = { ...a, ...change };
+    if (this.store.state.accounts.some(other => other.id !== id && accountKey(other) === accountKey(target)))
+      throw new UserError('目标学校已存在相同账号。');
+    return this.exclusive(id, async () => {
+      const crossTenant = accountKey(target) !== accountKey(a);
+      const retag = !crossTenant && target.school.id !== a.school.id;
+      if (change.device || crossTenant || retag) {
+        if (!crossTenant) this.assertUniqueDevice(target);
+        await commitBindings(this.store, this.registry, entries => {
+          if (retag) return entries.retagTenant(a, target);
+          if (!crossTenant) return entries.replace(a, target.device, 'manual');
+          entries.verify(a);
+          if (!entries.get(target)) throw new UserError('目标学校尚无设备绑定，请先为该校明确添加账号。');
+          return entries.create(target);
+        }, binding => {
+          applyBinding(target, binding);
+          this.assertUniqueDevice(target);
+          if (crossTenant || retag) {
+            for (const library of this.store.state.libraries) {
+              if (library.scope === 'private' && library.ownerAccountId === id) {
+                library.schoolBaseUrl ??= a.school.baseUrl;
+                library.schoolId ??= a.school.id;
+              }
+            }
+            delete a.libraryId; delete target.libraryId;
+          }
+          Object.assign(a, target);
+          if (identity(a) !== oldIdentity) this.invalidateProfile(a);
+        });
+      } else {
+        Object.assign(a, target);
+        if (identity(a) !== oldIdentity) this.invalidateProfile(a);
+      }
+      recordActivity(this.store.state, 'profile', { accountId: id });
+    });
   }
-  async regenerateDevice(id: string) {
-    const a = this.account(id);
-    await this.configure(id, { device: { ...a.device, androidId: allocateAndroidId(this.store.state.accounts) } });
-    return deviceHeaders(a.device);
-  }
-  private validateDevice(d: Device) {
-    if (!/^[a-f\d]{16}$/i.test(d.androidId) || /^0+$/.test(d.androidId) || !/^\d+$/.test(d.sdk) ||
-      !/^[a-zA-Z0-9_. -]{1,64}$/.test(d.model) || d.model !== d.model.trim() ||
-      [d.manufacturer, d.androidRelease, d.buildId, d.appVersion].some(v => !v || v.length > 64 || !/^[a-zA-Z0-9_.-]+$/.test(v)))
-      throw new UserError('设备字段格式错误：Android ID 需 16 位十六进制；型号可含空格，其余字段仅用字母数字点横线。');
+  private invalidateProfile(a: Account) {
+    if (a.session) a.session.status = 'invalid';
+    delete a.compatibility; delete a.information; delete a.recordCache;
+    this.recordCache.delete(a.id); this.informationAttempts.delete(a.id);
+    this.schoolAttempts.delete(a.id); this.noticeAttempts.delete(a.id);
+    const client = this.clients.get(a.id);
+    this.clients.delete(a.id);
+    void client?.transport.close().catch(() => {});
   }
   private async exclusive<T>(id: string, work: () => Promise<T>): Promise<T> {
+    this.assertWritable();
     if (this.operations.has(id)) throw new UserError('此账号正在处理其他操作。');
     this.operations.add(id);
     try { return await work(); }
@@ -409,54 +648,39 @@ export class Engine extends EventEmitter {
   }); }
   async configureSchool(schoolInput: string | SchoolDirectoryEntry, proxy = '') {
     if (this.operations.size || this.store.state.tasks.some(t => activeTask(t))) throw new UserError('先处理未结束任务，再修改学校配置。');
-    const prevDefaultId = this.store.state.settings.schoolId;
-    this.store.state.settings.schoolProxy = validateProxy(proxy);
-    if (typeof schoolInput === 'object' && schoolInput !== null) {
-      const baseUrl = normalizeSchoolServerUrl(schoolInput.baseUrl, schoolInput.code);
-      if (!baseUrl) throw new UserError('学校服务地址无效。');
-      const sid = String(schoolInput.id ?? '').trim();
-      this.store.state.settings.schoolId = sid;
-      this.store.state.settings.schoolName = String(schoolInput.name ?? '').trim().slice(0, 60) || undefined;
-      this.store.state.settings.schoolNameEn = String(schoolInput.nameEn ?? '').trim().slice(0, 80) || undefined;
-      const distinctSchools = new Set(this.store.state.accounts.map(a => a.school.baseUrl)).size;
+    this.assertWritable();
+    const directory = typeof schoolInput === 'string' ? undefined : schoolInput;
+    const id = (typeof schoolInput === 'string' ? schoolInput : schoolInput.id).trim();
+    const baseUrl = directory && normalizeSchoolServerUrl(directory.baseUrl, directory.code);
+    if ((directory && !baseUrl) || !/^[a-zA-Z0-9_-]{1,32}$/.test(id)) throw new UserError('学校服务配置无效。');
+    const settings = this.store.state.settings;
+    const schoolProxy = validateProxy(proxy);
+    const keys = this.store.state.accounts.map(accountKey);
+    if (new Set(keys).size !== keys.length) throw new UserError('学校配置含重复账号，请先核对。');
+    if (directory && baseUrl) {
       for (const a of this.store.state.accounts) {
-        // 多校并存时仅更新原同源或尚未绑定独立网关的账号，避免误覆盖其他高校账号
-        if (distinctSchools > 1 && a.school.baseUrl !== baseUrl && a.school.id !== prevDefaultId) continue;
-        const sameEndpoint = a.school.baseUrl === baseUrl && a.school.provinceCode === schoolInput.provinceCode && a.school.randomCode === schoolInput.randomCode;
-        const previous = identity(a);
-        a.school = {
-          id: sid,
-          provinceCode: String(schoolInput.provinceCode ?? '').trim().slice(0, 16),
-          randomCode: String(schoolInput.randomCode ?? '').trim().slice(0, 16),
-          baseUrl,
-          name: this.store.state.settings.schoolName,
-          nameEn: this.store.state.settings.schoolNameEn,
-          code: String(schoolInput.code ?? '').trim().slice(0, 32) || undefined,
-          ...(schoolInput.loginType ? { loginType: schoolInput.loginType } : {}),
-          ...(schoolInput.loginUrl ? { loginUrl: schoolInput.loginUrl } : {}),
-        };
-        a.compatibility = undefined; a.information = undefined; a.recordCache = undefined;
-        this.recordCache.delete(a.id); this.informationAttempts.delete(a.id); this.schoolAttempts.delete(a.id); this.noticeAttempts.delete(a.id);
-        if (sameEndpoint && a.session?.identity === previous) a.session.identity = identity(a);
-        else if (!sameEndpoint && a.session) a.session.status = 'invalid';
-      }
-    } else {
-      const schoolId = schoolInput.trim();
-      this.store.state.settings.schoolId = schoolId;
-      const distinctSchools = new Set(this.store.state.accounts.map(a => a.school.baseUrl)).size;
-      for (const a of this.store.state.accounts) {
-        if (distinctSchools > 1 && a.school.id !== prevDefaultId) continue;
-        const previous = identity(a); a.school.id = schoolId; a.compatibility = undefined; a.information = undefined; a.recordCache = undefined; this.recordCache.delete(a.id); this.informationAttempts.delete(a.id); this.schoolAttempts.delete(a.id); this.noticeAttempts.delete(a.id);
-        if (a.session?.identity === previous) a.session.identity = identity(a);
+        const school = { ...a.school, ...directory, id, baseUrl };
+        if (a.school.id !== id || accountKey(a) !== accountKey({ ...a, school })) continue;
+        const oldIdentity = identity(a);
+        a.school = school;
+        if (identity(a) !== oldIdentity) this.invalidateProfile(a);
       }
     }
+    settings.schoolProxy = schoolProxy;
+    if (directory || id !== settings.schoolId) {
+      settings.schoolName = directory?.name;
+      settings.schoolNameEn = directory?.nameEn;
+    }
+    settings.defaultSchool = directory && baseUrl ? { ...directory, id, baseUrl } :
+      this.store.state.accounts.find(a => a.school.id === id)?.school;
+    settings.schoolId = id;
     this.store.state.settings.compatibility = undefined; await this.store.save();
   }
   async checkSchool() {
     if (this.checkingSchool) return this.checkingSchool;
     this.checkingSchool = (async () => {
       const profile = this.profile;
-      const refSchool = this.store.state.accounts[0]?.school;
+      const refSchool = this.store.state.settings.defaultSchool ?? this.store.state.accounts.find(a => a.school.id === this.store.state.settings.schoolId)?.school;
       const sample = newAccount('school-check', 'metadata-only', this.store.state.settings.schoolId ?? refSchool?.id ?? profile.schoolId ?? '', profile);
       if (refSchool) sample.school = { ...refSchool, id: sample.school.id };
       const transport = new Transport(this.store.state.settings.schoolProxy ?? '', this.mock, sample.school.baseUrl);
@@ -479,24 +703,68 @@ export class Engine extends EventEmitter {
     if (!password) throw new UserError('密码不能为空。');
     const trimmed = password.trim();
     const tokenParts = trimmed.split('.');
-    // 支持 CAS 统一身份认证高校（如浙大/华科/西交等 loginType=3）直接粘贴 5 段式回调 Token
     if (tokenParts.length === 5 && tokenParts[3]!.length >= 16 && /^\d{10,16}$/.test(tokenParts[4]!)) {
+      const jwt = `${tokenParts[0]}.${tokenParts[1]}.${tokenParts[2]}`;
+      const secret = tokenParts[3]!;
+      const loginOutTime = tokenParts[4]!;
+      const claims = parseJwtClaims(jwt);
+      if (!claims?.sub) {
+        applyBinding(a, await this.registry.transaction(entries => entries.verify(a, true)));
+        throw new UserError('无法验证粘贴令牌的学校与账号归属，请使用学校认证流程。');
+      }
+      if (claims.sub !== a.username) throw new UserError('粘贴令牌的学号与当前账号不一致。');
+      if (claims.schoolId && a.school.id && claims.schoolId !== a.school.id) {
+        throw new UserError('粘贴令牌的学校与当前账号不一致。');
+      }
+      if ((claims.exp !== undefined && claims.exp * 1000 <= Date.now()) || Number(loginOutTime) <= Date.now()) {
+        throw new UserError('粘贴令牌已过期，请重新获取。');
+      }
       await this.preflight(a);
-      const protocol = this.client(a);
+      applyBinding(a, await this.registry.transaction(entries => entries.verify(a, true)));
+      await this.store.save();
+      const verifyTransport = new Transport(a.proxy, this.mock, a.school.baseUrl);
+      let xm = '';
+      let gender = '1';
+      try {
+        const verifyPath = `api/l/v6/u/info?xh=${encodeURIComponent(a.username)}`;
+        const sig = await new NativeSigner({ secret }).sign({ method: 'GET', signPath: `/${verifyPath}` });
+        const d = deviceHeaders(a.device);
+        const resp = await verifyTransport.fetch(a.school.baseUrl + verifyPath, {
+          method: 'GET',
+          headers: {
+            imei: d.imei,
+            'User-Agent': d.userAgent,
+            v1: buildV1(),
+            client: buildClient(secret),
+            cgAuthorization: jwt,
+            timestamp: sig.timestamp,
+            sign: sig.sign,
+          },
+        });
+        const api = resp.ok ? await resp.json() as { code?: unknown; data?: Record<string, unknown> } : undefined;
+        if (!api || api.code !== 200 || !api.data || typeof api.data !== 'object' || String(api.data.xh ?? '') !== a.username) {
+          throw new UserError('无法验证粘贴令牌的学校与账号归属，请确认令牌未失效。');
+        }
+        xm = safeText(api.data.xm ?? '', 40);
+        gender = String(api.data.xb ?? '1') === '2' ? '2' : '1';
+      } finally {
+        await verifyTransport.close();
+      }
       a.session = {
         id: randomUUID(),
-        token: `${tokenParts[0]}.${tokenParts[1]}.${tokenParts[2]}`,
-        secret: tokenParts[3]!,
-        loginOutTime: tokenParts[4]!,
+        token: jwt,
+        secret,
+        loginOutTime,
         xh: a.username,
-        name: '',
-        gender: '1',
+        name: xm,
+        gender,
         identity: identity(a),
         createdAt: Date.now(),
-        status: 'saved',
+        status: 'verified',
       };
       a.information = undefined; a.recordCache = undefined; this.recordCache.delete(id); this.informationAttempts.delete(id); this.schoolAttempts.delete(id); this.noticeAttempts.delete(id);
       try {
+        const protocol = this.client(a);
         a.information = await fetchInformation(a, protocol.fetch, 'school');
         this.schoolAttempts.set(id, Date.now());
         this.alignIdleAccountRoutes();
@@ -506,6 +774,7 @@ export class Engine extends EventEmitter {
     }
     if (Date.now() - (a.lastLoginAt ?? 0) < 60_000) throw new UserError('请间隔 60 秒再登录。');
     await this.preflight(a);
+    applyBinding(a, await this.registry.transaction(entries => entries.verify(a, true)));
     a.lastLoginAt = Date.now(); await this.store.save();
     const protocol = this.client(a);
     try {
@@ -513,7 +782,7 @@ export class Engine extends EventEmitter {
     } catch (err) {
       if (a.school.loginType === '3') {
         const msg = err instanceof UserError ? err.message : '登录失败';
-        throw new UserError(`${msg}（该校启用了统一身份认证：可在记录库按 P/I 从手机备份自动带入登录态，或粘贴 5 段 CAS Token）`);
+        throw new UserError(`${msg}（该校启用了统一身份认证：可粘贴 5 段 CAS Token，或在记录库按 P/I 从手机备份恢复）`);
       }
       throw err;
     }
@@ -615,9 +884,9 @@ export class Engine extends EventEmitter {
       const stamp = old?.identity === identity(a) && old.sessionId === session.id ? old.schoolFetchedAt : undefined;
       const last = this.schoolAttempts.get(id) ?? stamp; if (last !== undefined && now - last < 60_000) throw new UserError('请间隔 60 秒再刷新学校资料。');
       this.schoolAttempts.set(id, now); await this.preflight(a); a.information = await fetchInformation(a, protocol.fetch, 'school');
-      const count = [a.information.rules, a.information.reasons].filter(r => r.data !== undefined).length;
+      const count = [a.information.rules, a.information.reasons, a.information.deviceLimits].filter(r => r?.data !== undefined).length;
       if (count === 0 && a.information.rules.code === 2003) this.schoolAttempts.set(id, 0);
-      recordActivity(this.store.state, 'school-information', { accountId: id, count, level: count === 2 ? 'ok' : 'warn' }); return a.information;
+      recordActivity(this.store.state, 'school-information', { accountId: id, count, level: count === 3 ? 'ok' : 'warn' }); return a.information;
     });
   }
   async schoolNotices(id: string, refresh = false): Promise<AccountInformation> {
@@ -751,8 +1020,16 @@ export class Engine extends EventEmitter {
   }
   async clearSession(id: string) {
     if (this.hasTask(id) || this.operations.has(id)) throw new UserError('请先处理任务或等待请求结束。');
-    const a = this.account(id); a.session = undefined; a.information = undefined; a.recordCache = undefined; this.recordCache.delete(id); this.informationAttempts.delete(id); this.schoolAttempts.delete(id); this.noticeAttempts.delete(id);
-    recordActivity(this.store.state, 'session-cleared', { accountId: id }); await this.store.save();
+    return this.exclusive(id, async () => {
+      const a = this.account(id);
+      if (a.session) {
+        await this.registry.transaction(entries => entries.observe({ ...a, deviceUsage: 'attempted' }));
+        a.deviceUsage = 'attempted';
+      }
+      delete a.session; delete a.information; delete a.recordCache;
+      this.recordCache.delete(id); this.informationAttempts.delete(id); this.schoolAttempts.delete(id); this.noticeAttempts.delete(id);
+      recordActivity(this.store.state, 'session-cleared', { accountId: id });
+    });
   }
   async prepare(id: string, libraryId: string, options: PrepareOptions = {}) {
     const a = this.account(id);
@@ -774,16 +1051,21 @@ export class Engine extends EventEmitter {
     return this.prepare(id, library.id, options);
   }
   async deleteAccount(id: string) {
+    this.assertWritable();
     if (this.operations.has(id) || this.store.state.tasks.some(t => t.accountId === id && activeTask(t) && t.phase !== 'queued' && !(t.phase === 'paused' && t.resumePhase === 'queued')))
       throw new UserError('账号有已开始或待核对任务，请先处理。');
-    const libs = this.store.state.libraries.filter(l => l.scope === 'private' && l.ownerAccountId === id);
-    this.store.state.accounts = this.store.state.accounts.filter(a => a.id !== id);
-    this.store.state.tasks = this.store.state.tasks.filter(t => t.accountId !== id);
-    this.store.state.libraries = this.store.state.libraries.filter(l => !libs.includes(l));
-    this.store.state.activity = this.store.state.activity?.filter(e => e.accountId !== id);
-    recordActivity(this.store.state, 'account-deleted');
-    await this.store.save(); await Promise.all(libs.map(l => this.store.deleteLibrary(l.id)));
-    await this.clients.get(id)?.transport.close(); this.clients.delete(id); this.recordCache.delete(id); this.informationAttempts.delete(id); this.schoolAttempts.delete(id); this.noticeAttempts.delete(id); this.emit('change');
+    return this.exclusive(id, async () => {
+      const account = this.account(id);
+      await this.registry.transaction(entries => entries.verify(account));
+      const libs = this.store.state.libraries.filter(l => l.scope === 'private' && l.ownerAccountId === id);
+      this.store.state.accounts = this.store.state.accounts.filter(a => a.id !== id);
+      this.store.state.tasks = this.store.state.tasks.filter(t => t.accountId !== id);
+      this.store.state.libraries = this.store.state.libraries.filter(l => !libs.includes(l));
+      this.store.state.activity = this.store.state.activity?.filter(e => e.accountId !== id);
+      recordActivity(this.store.state, 'account-deleted');
+      await this.store.save(); await Promise.all(libs.map(l => this.store.deleteLibrary(l.id)));
+      await this.clients.get(id)?.transport.close(); this.clients.delete(id); this.recordCache.delete(id); this.informationAttempts.delete(id); this.schoolAttempts.delete(id); this.noticeAttempts.delete(id); this.emit('change');
+    });
   }
   private taskAccount(t: Task) {
     const a = this.account(t.accountId), s = this.client(a).session(a);
@@ -793,7 +1075,9 @@ export class Engine extends EventEmitter {
     return a;
   }
   private assertPreparedDevice(a: Account, p: Prepared) {
-    if ((p.accountIdentity && p.accountIdentity !== identity(a)) || p.body.phoneVersion !== phoneVersion(a.device))
+    if ((p.deviceRevision !== undefined && p.deviceRevision !== a.deviceRevision) ||
+      (p.preparedSessionId !== undefined && p.preparedSessionId !== a.session?.id) ||
+      (p.accountIdentity && p.accountIdentity !== identity(a)) || p.body.phoneVersion !== phoneVersion(a.device))
       throw new UserError('方案中的设备档案已过期，请重新准备。');
   }
   private runningCount() { return this.store.state.tasks.filter(t => ['starting', 'waiting', 'committing'].includes(t.phase)).length; }
@@ -827,6 +1111,7 @@ export class Engine extends EventEmitter {
     });
   }
   async queuePlan(accountIds: string[], firstStartAt: number, staggerMs: number, options: PrepareOptions = {}) {
+    this.assertWritable();
     if (this.planning) throw new UserError('正在保存计划，请稍候。');
     const unique = [...new Set(accountIds)];
     if (!unique.length) throw new UserError('请至少选择一个账号。');
@@ -910,7 +1195,7 @@ export class Engine extends EventEmitter {
     } finally { recordActivity(this.store.state, 'task', { accountId: t.accountId, phase: t.phase, level: t.phase === 'review' ? 'warn' : 'info' }); await this.store.save(); this.emit('change'); }
   }
   async tick() {
-    if (this.ticking) return; this.ticking = true;
+    if (this.ticking || this.restoring || this.store.state.pendingBindings) return; this.ticking = true;
     try {
       const now = Date.now();
       const due = this.store.state.tasks.filter(t => t.phase === 'waiting' && this.armed.has(t.id) &&
@@ -983,6 +1268,7 @@ export class Engine extends EventEmitter {
   }
   async shutdown() {
     if (this.operations.size || this.planning || this.ticking) throw new UserError('正在处理，请稍候再退出。');
+    this.phoneCandidates.clear();
     for (const t of this.store.state.tasks) if (t.phase === 'waiting' || t.phase === 'queued') { t.resumePhase = t.phase; t.phase = 'paused'; t.note = '任务已暂停，按 R 恢复。'; }
     await this.store.save(); await this.store.flush();
     await Promise.allSettled([...this.clients.values()].map(c => c.transport.close())); this.store.close();

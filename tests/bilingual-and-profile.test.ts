@@ -353,12 +353,12 @@ test('官方学校目录搜索与登录自动拉取 /sporttype 电子围栏（�
   assert.ok(rules && rules.length >= 2);
   assert.equal(rules[0]!.boundaryGcj02?.length, 4);
 
-  // 支持 CAS 统一身份认证高校直接粘贴 5 段回调 Token 建立会话
+  // 粘贴的 CAS 凭据无法验证主体，保留使用历史并拒绝建立会话
   const casAcc = await engine.addAccount('统一认证号', 'cas2026', { ...picked, id: '2', baseUrl: 'https://cgapp.chingo.cn/cgapp-server/', loginType: '3' });
   const fakeSecret = Buffer.alloc(52, 7).toString('base64');
-  await engine.login(casAcc.id, `hdr.pld.sig.${fakeSecret}.1900000000000`);
-  assert.equal(store.state.accounts[1]!.session?.token, 'hdr.pld.sig');
-  assert.equal(store.state.accounts[1]!.session?.secret, fakeSecret);
+  await assert.rejects(engine.login(casAcc.id, `hdr.pld.sig.${fakeSecret}.1900000000000`), /无法验证/);
+  assert.equal(casAcc.session, undefined);
+  assert.equal(casAcc.deviceUsage, 'attempted');
 
   await engine.shutdown();
 });
@@ -465,16 +465,17 @@ test('内置纯 Node WCDB 数据库解密与安卓 .bak 备份包直接导入（
     const bakPath = join(work, '创高体育(net.crigh.cgsport).bak');
     await writeFile(bakPath, bakBuf);
 
-    // 验证 Engine 直接导入带引号路径的 .bak 文件，并自动把账号默认路线从 27 对齐到 24！
+    // 验证 Engine 直接导入带引号路径的 .bak 文件，账号默认路线保持原值。
     const store = new Store(null);
     const engine = new Engine(store, demoFetch);
     await engine.initialize();
     const acc = await engine.addAccount('测试号', 'stu99', '99');
     assert.equal(acc.routeId, '27');
+    const beforeRoute = store.state.accounts[0]!.routeId;
     const lib = await engine.importLibrary(`"${bakPath}"`, '手机备份记录', 'private', acc.id);
     assert.equal(lib.runCount, 1);
     assert.deepEqual(lib.routeIds, ['24']);
-    assert.equal(store.state.accounts[0]!.routeId, '24');
+    assert.equal(store.state.accounts[0]!.routeId, beforeRoute);
 
     // 验证 deleteLibrary 可安全删除记录库并清理绑定
     await engine.configure(acc.id, { libraryId: lib.id });

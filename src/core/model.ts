@@ -1,3 +1,4 @@
+import type { BindingChange } from './device-identity.js';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { androidIdToImei, buildUserAgent } from '../protocol/device.js';
 import type { UploadJsonSports } from '../protocol/types.js';
@@ -58,44 +59,66 @@ export interface AccountSchool {
   id: string; provinceCode: string; randomCode: string; baseUrl: string;
   name?: string; nameEn?: string; code?: string; loginType?: string; loginUrl?: string;
 }
+export type DeviceSource = 'existing' | 'tui' | 'manual' | 'portable' | 'phone';
+export type DeviceUsage = 'unused' | 'attempted' | 'unknown';
 export interface Account {
   id: string; label: string; username: string;
   school: AccountSchool;
   device: Device; proxy: string; routeId: string; sourceMode: SourceMode; libraryId?: string;
   session?: Session; compatibility?: Compatibility; lastLoginAt?: number;
+  bindingConflict?: boolean;
+  deviceSource?: DeviceSource; deviceUsage?: DeviceUsage; deviceRevision?: number;
   information?: AccountInformation; recordCache?: PersistedRecordCache;
 }
-const identityCache = new Map<string, string>();
-export const identity = (a: Pick<Account,'username'|'school'|'device'|'proxy'>) => {
-  const s = a.school, d = a.device;
-  const fastKey = `${a.username}\0${s.id}\0${s.provinceCode}\0${s.randomCode}\0${s.baseUrl}\0${d.androidId}\0${d.manufacturer}\0${d.model}\0${d.androidRelease}\0${d.sdk}\0${d.buildId}\0${d.appVersion}\0${a.proxy}`;
-  let hash = identityCache.get(fastKey);
-  if (!hash) {
-    hash = createHash('sha256').update(JSON.stringify({
-      username: a.username,
-      school: { id: s.id, provinceCode: s.provinceCode, randomCode: s.randomCode, baseUrl: s.baseUrl },
-      device: a.device,
-      proxy: a.proxy,
-    })).digest('hex');
-    if (identityCache.size > 256) identityCache.delete(identityCache.keys().next().value!);
-    identityCache.set(fastKey, hash);
+type IdentityFields = Pick<Account, 'username' | 'school' | 'device' | 'proxy'>;
+export function canonicalDevice(d: Device): Device {
+  return { androidId: d.androidId, manufacturer: d.manufacturer, model: d.model, androidRelease: d.androidRelease,
+    sdk: d.sdk, buildId: d.buildId, appVersion: d.appVersion };
+}
+function hashIdentity(a: IdentityFields, device: Device) {
+  const { id, provinceCode, randomCode, baseUrl } = a.school;
+  return createHash('sha256').update(JSON.stringify({
+    username: a.username, school: { id, provinceCode, randomCode, baseUrl }, device, proxy: a.proxy,
+  })).digest('hex');
+}
+export const identity = (a: IdentityFields) => hashIdentity(a, canonicalDevice(a.device));
+/** Accept only a digest that could be produced from this exact persisted profile. */
+export function migrateIdentity(a: Account, tasks: Task[] = []) {
+  const canonical = identity(a);
+  const { androidId, ...profile } = canonicalDevice(a.device);
+  const older = new Set([hashIdentity(a, a.device), hashIdentity(a, { ...profile, androidId })]);
+  older.delete(canonical);
+  const matches = (value?: string) => value !== undefined && older.has(value);
+  if (!older.size) return;
+  if (a.session && matches(a.session.identity)) a.session.identity = canonical;
+  if (a.information && matches(a.information.identity) && a.information.sessionId === a.session?.id) a.information.identity = canonical;
+  if (a.recordCache && matches(a.recordCache.identity) && a.recordCache.sessionId === a.session?.id) a.recordCache.identity = canonical;
+  for (const task of tasks) {
+    if (activeTask(task) && task.accountId === a.id && task.sessionId === a.session?.id && matches(task.identity)) {
+      task.identity = canonical;
+      if (matches(task.prepared.accountIdentity)) task.prepared = { ...task.prepared, accountIdentity: canonical };
+    }
   }
-  return hash;
-};
+}
+export function deviceUsage(a: Account): DeviceUsage {
+  if (a.session || a.lastLoginAt !== undefined || a.deviceUsage === 'attempted') return 'attempted';
+  return a.deviceUsage === 'unused' ? 'unused' : 'unknown';
+}
 export const compatibilityKey = (a: Account) => `${a.school.baseUrl}:${a.school.id}:${a.device.appVersion}:${PROTOCOL_REVISION}`;
 export interface Library {
   id: string; label: string; scope: SourceMode; ownerAccountId?: string;
-  schoolBaseUrl?: string; schoolName?: string;
+  schoolBaseUrl?: string; schoolName?: string; schoolId?: string;
+  attribution?: 'matched' | 'mismatch' | 'unverified'; modelHint?: string;
   runCount: number; routeIds: string[]; importedAt: number;
 }
 export function canUseLibrary(
   l: Library,
-  a: Pick<Account, 'id' | 'sourceMode'> & { school?: Pick<AccountSchool, 'baseUrl'> },
+  a: Pick<Account, 'id' | 'sourceMode'> & { school?: Pick<AccountSchool, 'baseUrl'> & { id?: string } },
 ) {
   if (l.scope !== a.sourceMode) return false;
-  if (l.scope === 'private') return l.ownerAccountId === a.id;
+  if (l.schoolId && a.school?.id && l.schoolId !== a.school.id) return false;
   if (l.schoolBaseUrl && a.school?.baseUrl && l.schoolBaseUrl !== a.school.baseUrl) return false;
-  return true;
+  return l.scope !== 'private' || l.ownerAccountId === a.id;
 }
 export function cachedInformation(a:Pick<Account,'username'|'school'|'device'|'proxy'|'information'>&{session?:Pick<Session,'id'>}):AccountInformation|undefined{
  const info=a.information;return info?.identity===identity(a)&&info.sessionId===a.session?.id?info:undefined;
@@ -104,7 +127,8 @@ export interface Prepared {
   body: UploadJsonSports; sensor: number[]; routeId: string; libraryId: string;
   sourceRunId: number; seed: number; durationSec: number; sensorSource: 'recorded' | 'generated';
   sourceDistanceKm?: number;
-  accountIdentity?: string;
+  rawGeometryMeters?: number; rawGeometryCoverage?: 'partial' | 'unavailable';
+  accountIdentity?: string; deviceRevision?: number; preparedSessionId?: string;
   candidateCount?:number;sourceDurationSec?:number;targets?:OneShotTargets;
   fit?:{sourceWindowSec:number;timeScale:number};
   generation?:'auto'|'manual'|'legacy';
@@ -126,12 +150,13 @@ export interface Task {
   audit?: { checkedAt:number; found:boolean; record?:import('../protocol/records.js').WorkoutRecord; recordAt?:number };
 }
 export interface State {
+  pendingBindings?: BindingChange[];
   runtimeMode?:'demo';
   schemaVersion: 1; accounts: Account[]; libraries: Library[]; tasks: Task[];
   activity?: ActivityEntry[];
   settings: {
     maxConcurrent: number; notifications?:boolean; termTarget?: number;
-    schoolId?: string; schoolProxy?: string; schoolName?: string; schoolNameEn?: string; compatibility?: Compatibility;
+    defaultSchool?: AccountSchool; schoolId?: string; schoolProxy?: string; schoolName?: string; schoolNameEn?: string; compatibility?: Compatibility;
     colorTheme?: ColorTheme; logoFont?: LogoFont; visualStyle?: VisualStyle;
     visualOpacity?: number; gradientSpeed?: number; animationFps?:number;
     motion?: boolean; privacyMode?: boolean; language?: Language;
@@ -139,10 +164,10 @@ export interface State {
 }
 export const emptyState = (): State => ({ schemaVersion: 1, accounts: [], libraries: [], tasks: [], settings: { maxConcurrent: 2 } });
 export const activeTask = (t: Pick<Task,'phase'>) => !['done', 'abandoned'].includes(t.phase);
-export const newAccount = (label: string, username: string, schoolId: string, profile: SchoolProfile = DEFAULT_SCHOOL_PROFILE): Account => ({
+export const newAccount = (label: string, username: string, schoolId: string, profile: SchoolProfile = DEFAULT_SCHOOL_PROFILE, device: Device = defaultDevice()): Account => ({
   id: randomUUID(), label, username,
   school: { id: schoolId, provinceCode: profile.provinceCode, randomCode: profile.randomCode, baseUrl: profile.baseUrl },
-  device: defaultDevice(), proxy: '', routeId: profile.defaultRouteId, sourceMode: 'private',
+  device, proxy: '', routeId: profile.defaultRouteId, sourceMode: 'private',
 });
 export class UserError extends Error {}
 export function safeText(v: unknown, max = 180): string {

@@ -8,8 +8,12 @@ export function commandsFor(invoke: Invoke): AppCommands {
   return {
     listSchools: (...args) => invoke("listSchools", args),
     addAccount: (...args) => invoke("addAccount", args),
+    inspectDevice: (...args) => invoke("inspectDevice", args),
+    acceptRegisteredDevice: (...args) => invoke("acceptRegisteredDevice", args),
+    inspectPhoneCandidate: (...args) => invoke("inspectPhoneCandidate", args),
+    adoptPhoneCandidate: (...args) => invoke("adoptPhoneCandidate", args),
+    stagePhoneCandidate: (...args) => invoke("stagePhoneCandidate", args),
     configure: (...args) => invoke("configure", args),
-    regenerateDevice: (...args) => invoke("regenerateDevice", args),
     configureAppearance: (...args) => invoke("configureAppearance", args),
     setColorTheme: (...args) => invoke("setColorTheme", args),
     configureSettings: (...args) => invoke("configureSettings", args),

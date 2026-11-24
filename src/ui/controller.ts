@@ -9,7 +9,7 @@ import {
   resolveVisual,
   visualNames,
 } from "../render/chroma.js";
-import { dateTime, informationLines, schoolLines } from "./information-view.js";
+import { cachedInformation, dateTime, informationLines, schoolLines } from "./information-view.js";
 import { languages, localizeBackendText, resolveLanguage, tr } from "../core/i18n.js";
 import {
   filterFonts,
@@ -18,7 +18,6 @@ import {
 } from "../render/logo-fonts.js";
 import {
   activeTask,
-  cachedInformation,
   safeText,
   UserError,
   type LogoFont,
@@ -1109,8 +1108,8 @@ export class UIController extends EventEmitter {
       const res = await this.app.commands.importBackup(filePath, passphrase);
       this.view.notice =
         lang === "en"
-          ? `Imported: +${res.accountsAdded} accounts (updated ${res.accountsUpdated}) · +${res.librariesAdded} libraries.`
-          : `导入完成：新增账号 ${res.accountsAdded}（更新 ${res.accountsUpdated}）· 新增记录库 ${res.librariesAdded}。`;
+          ? `Imported: +${res.accountsAdded} accounts (updated ${res.accountsUpdated}, conflicts ${res.conflicts?.length ?? 0}, sessions skipped ${res.sessionsSkipped ?? 0}) · +${res.librariesAdded} libraries.`
+          : `导入完成：新增账号 ${res.accountsAdded}（更新 ${res.accountsUpdated}，冲突 ${res.conflicts?.length ?? 0}，跳过会话 ${res.sessionsSkipped ?? 0}）· 新增记录库 ${res.librariesAdded}。`;
     } finally {
       passphrase = "";
     }

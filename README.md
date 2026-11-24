@@ -21,6 +21,8 @@ npm start          # 启动界面
 npm run build:exe  # 打包独立单文件 release\cgscaline.exe
 ```
 
+正式档案跨目录共用当前 Windows 用户的 `%LOCALAPPDATA%\CGSPORT\device-registry.dpapi`。升级时请先打开原档案完成已有设备回填，再创建自定义测试目录。删除账号会保留其设备绑定，跨电脑迁移可使用加密便携备份（演示模式使用内存注册表）。导入手机备份或 ADB 提取运动记录时，可按提示选择同步本人真机设备档案与有效会话；若本地设备出现冲突，可在设备设置中核对并确认。
+
 想先不联网看一眼效果可以直接跑 `npm run demo`（或 `cgscaline.exe --demo`）。
 
 ## 首次使用

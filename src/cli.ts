@@ -2,6 +2,7 @@ import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { Store, unlockStale } from './runtime/storage.js';
+import { MemoryDeviceRegistry } from './runtime/device-registry.js';
 import { UserError } from './core/model.js';
 import { useColor } from './render/appearance.js';
 import { cliLanguage } from './core/i18n.js';
@@ -16,8 +17,8 @@ async function main() {
     throw new UserError(en ? 'Requires Node.js 22.19+ or 24 LTS.' : '此构建支持 Node 22.19+ / 24；请使用对应 LTS 版本。');
   if (args.includes('--help') || args.includes('-h')) {
     process.stdout.write(en
-      ? `${APP_NAME}\n\n  npm start         Launch TUI & connect/spawn daemon\n  npm run demo      Offline synthetic demo (--en for English)\n  npm run preview   Render single ANSI preview frame\n\n  --en / --zh       Switch UI language (or press L on Home)\n  --headless        Start background daemon and exit\n  --status          Print daemon & task queue status\n  --stop            Pause tasks and stop daemon\n  --data-dir PATH   Custom DPAPI vault directory\n  --unlock          Clear stale lock from exited process\n  --color / --no-color\n  --no-motion       Freeze shader backdrop\n`
-      : `${APP_NAME}\n\n  npm start         打开界面，连接或启动后台\n  npm run demo      离线演示（附加 --en 切换英文界面）\n  npm run preview   演示界面预览\n\n  --en / --zh       指定界面语言（主页按 L 也可随时切换）\n  --headless        启动后台后返回\n  --status          查看后台与任务状态\n  --stop            暂停任务并停止后台\n  --data-dir PATH   自定义加密档案目录\n  --unlock          检查并释放已退出进程的旧锁\n  --color / --no-color\n  --no-motion       固定装饰画面\n`);
+      ? `${APP_NAME}\n\n  npm start         Launch TUI & connect/spawn daemon\n  npm run demo      Offline synthetic demo (--en for English)\n  npm run preview   Render single ANSI preview frame\n\n  --en / --zh       Switch UI language (or press L on Home)\n  --headless        Start background daemon and exit\n  --status          Print daemon & task queue status\n  --stop            Pause tasks and stop daemon\n  --data-dir PATH   Custom vault directory (live device bindings are shared)\n  --unlock          Clear stale lock from exited process\n  --color / --no-color\n  --no-motion       Freeze shader backdrop\n`
+      : `${APP_NAME}\n\n  npm start         打开界面，连接或启动后台\n  npm run demo      离线演示（附加 --en 切换英文界面）\n  npm run preview   演示界面预览\n\n  --en / --zh       指定界面语言（主页按 L 也可随时切换）\n  --headless        启动后台后返回\n  --status          查看后台与任务状态\n  --stop            暂停任务并停止后台\n  --data-dir PATH   自定义加密档案目录（正式设备绑定跨目录共用）\n  --unlock          检查并释放已退出进程的旧锁\n  --color / --no-color\n  --no-motion       固定装饰画面\n`);
     return;
   }
   const demo = args.includes('--demo'), index = args.indexOf('--data-dir');
@@ -30,7 +31,7 @@ async function main() {
   if (args.includes('--preview') && !demo) throw new UserError(en ? 'Use --demo with --preview.' : '预览请使用 --demo，不输出真实档案。');
   if (demo && !headless && !status && !stop) {
     const [{ Engine }, { demoFetch, seedDemo }] = await Promise.all([import('./runtime/engine.js'), import('./core/demo.js')]);
-    const store = new Store(null); await store.open(); const engine = new Engine(store, demoFetch);
+    const store = new Store(null); await store.open(); const engine = new Engine(store, demoFetch, new MemoryDeviceRegistry());
     try {
       await seedDemo(store, forcedLang ?? 'zh'); await engine.initialize();
       if (forcedLang) store.state.settings.language = forcedLang;

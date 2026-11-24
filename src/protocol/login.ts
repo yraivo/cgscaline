@@ -86,7 +86,7 @@ export interface LoginOptions {
   school?: LoginSchoolConfig;
   userAgent?: string;
   version?: string;
-  /** 同一设备档案应贯穿登录、查询与提交。缺省保持旧客户端行为。 */
+  /** 同一设备档案应贯穿登录、查询与提交。缺失时在本地中止。 */
   imei?: string;
   /** 注入 fetch（测试用） */
   fetchImpl?: typeof fetch;
@@ -101,6 +101,7 @@ export async function login(
   password: string,
   opts: LoginOptions = {},
 ): Promise<LoginResult> {
+  if (!opts.imei?.trim()) throw new Error("缺少账号设备标识。");
   const base = (opts.baseUrl ?? "https://cgapp.chingo.cn/cgapp-server/").replace(/\/?$/, "/");
   const school = opts.school ?? DEFAULT_SCHOOL;
   const fetchImpl = opts.fetchImpl ?? fetch;
@@ -130,7 +131,7 @@ export async function login(
     method: "POST",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
-      imei: opts.imei ?? "00000000-267c-21f8-267c-21f800000000",
+      imei: opts.imei,
       timestamp: ts,
       sign: fields.sign,
       "User-Agent": userAgent,

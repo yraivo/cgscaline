@@ -64,7 +64,7 @@ try{
   assert.equal(requests.length,beforeTheme);await key('r','r');assert.equal(requests.length,beforeTheme+4);
   await key('escape');assert.equal(ui.view.screen,'menu');await key('escape');
   await openMore(4);assert.equal(ui.view.screen,'school');
-  assert.equal(requests.length,beforeTheme+4);await key('r','r');assert.equal(requests.length,beforeTheme+6);
+  assert.equal(requests.length,beforeTheme+4);await key('r','r');assert.equal(requests.length,beforeTheme+7);
   await key('2','2');assert.equal(ui.view.infoTab,1);
   await key('right');assert.equal(ui.view.infoTab,0);
   const beforeTab=requests.length;await key('tab');assert.equal(requests.length,beforeTab);await key('tab');

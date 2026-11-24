@@ -1,4 +1,4 @@
-import type { Account, Prepared, Task } from "../core/model.js";
+import { UserError, type Account, type Prepared, type Task } from "../core/model.js";
 import type { Snapshot, WorkerChannel } from "../runtime/ipc.js";
 import { ClientState, commandsFor, type Invoke } from "./client.js";
 import type { AppClient, AppCommands } from "./contracts.js";
@@ -8,6 +8,7 @@ export class RemoteAppClient extends ClientState implements AppClient {
   readonly commands: AppCommands;
   private channel?: WorkerChannel;
   private revision = 0;
+  private previousWorker = false;
   get connected() {
     return (
       !!this.channel &&
@@ -18,6 +19,8 @@ export class RemoteAppClient extends ClientState implements AppClient {
   constructor() {
     super();
     const invoke = async (method: keyof AppCommands, args: unknown[]) => {
+      if (this.previousWorker && !['stopBackground', 'pause', 'loadCachedRecords'].includes(method))
+        throw new UserError("后台版本过旧，请暂停任务并重启后台后再操作。");
       const wire = [...args];
       if (method === "start" || method === "queuePrepared")
         wire[1] = (args[1] as { draftId: string }).draftId;
@@ -37,11 +40,17 @@ export class RemoteAppClient extends ClientState implements AppClient {
   accept = (snapshot: Snapshot) => {
     if (snapshot.revision <= this.revision) return;
     this.revision = snapshot.revision;
-    this.state =
-      snapshot.viewVersion === 2
-        ? (snapshot.state as typeof this.state)
+    this.previousWorker = snapshot.viewVersion !== 3;
+    if (snapshot.viewVersion === 2) {
+      const old = snapshot.state as typeof this.state;
+      const accounts = old.accounts as Account[];
+      this.state = { ...old, accounts: accounts.map(a => accountView(a, accounts)) };
+    } else {
+      this.state = snapshot.viewVersion === 3 ? snapshot.state as typeof this.state
         : appState(snapshot.state as import("../core/model.js").State);
+    }
     this.notices = [...snapshot.notices];
+    if (this.previousWorker) this.notices.push("旧后台运行中，请暂停任务并重启以启用设备保护。");
     this.changed();
   };
   attach(channel: WorkerChannel) {

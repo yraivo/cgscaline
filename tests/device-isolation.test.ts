@@ -61,16 +61,16 @@ test('手动配置拦截原 ID 与派生 imei 重复，失败不污染原档案�
   await assert.rejects(e.configure(b.id, { device: { ...b.device, androidId: '0000000000000000' } }), /格式错误/);
   assert.deepEqual(b, before);
   await e.configure(b.id, { device: { ...b.device, androidId: '1234567890ABCDEF' } });
-  assert.equal(b.device.androidId, '1234567890abcdef'); assert.equal(b.session!.status, 'invalid');
+  assert.equal(b.device.androidId, '1234567890ABCDEF'); assert.equal(b.session!.status, 'invalid');
 });
 
-test('旧空档案自动分配新 ID，保留已有会话绑定且零网络', async () => {
+test('旧空档案保留冲突值并阻止认证，全程零网络', async () => {
   const store = new Store(null), a = newAccount('old-session', 'placeholder1', 'school'), b = newAccount('old-empty', 'placeholder2', 'school');
   a.device.androidId = b.device.androidId = LEGACY_ANDROID_ID; a.session = demoSession(a);
   const token = a.session.token; store.state.accounts.push(a, b);
   const e = new Engine(store, async () => { throw new Error('must stay offline'); });
   await e.initialize(); assert.equal(a.device.androidId, LEGACY_ANDROID_ID); assert.equal(a.session.token, token);
-  assert.notEqual(b.device.androidId, LEGACY_ANDROID_ID); assert.equal(deviceConflicts(a, store.state.accounts).length, 0);
+  assert.equal(b.device.androidId, LEGACY_ANDROID_ID); assert.equal(deviceConflicts(a, store.state.accounts).length, 1);
   assert.ok(e.startupNotices.some(v => v.includes('old-empty')));
 });
 
@@ -93,7 +93,7 @@ test('显式更换仅修改当前账号标识并使其旧会话需登录；不�
   assert.ok(a && b); a.device.androidId = b.device.androidId = LEGACY_ANDROID_ID;
   a.session = demoSession(a); b.session = demoSession(b); const originalA = structuredClone(a);
   const e = new Engine(store, async () => { throw new Error('must stay offline'); });
-  await e.regenerateDevice(b.id);
+  await e.configure(b.id, { device: { ...b.device, androidId: allocateAndroidId(store.state.accounts) } });
   assert.deepEqual(a, originalA); assert.notEqual(b.device.androidId, a.device.androidId);
   assert.notEqual(deviceHeaders(b.device).imei, deviceHeaders(a.device).imei);
   assert.equal(b.session.status, 'invalid'); assert.equal(deviceConflicts(a, store.state.accounts).length, 0);
@@ -124,8 +124,10 @@ test('请求边界拒绝串用其他账号 token、错误 imei 和旧 client；�
   const originalXh = a.session!.xh; a.session!.xh = b.username;
   assert.throws(() => p.session(a), /登录信息已失效/);
   await assert.rejects(p.fetch(url, { headers }), /登录信息.*不匹配/); a.session!.xh = originalXh;
+  const previousDevice = a.device.androidId;
   a.device.androidId = allocateAndroidId(store.state.accounts);
   await assert.rejects(p.fetch(url, { headers }), /配置已变化/); assert.equal(calls, 0);
+  a.device.androidId = previousDevice;
   await e.deleteAccount(a.id);
   await assert.rejects(p.fetch(url, { headers }), /账号不存在/); assert.equal(calls, 0);
 });
@@ -177,15 +179,15 @@ test('两个账号从登录/查询/续期到五阶段任务都使用各自稳定
 test('设备变更后旧预览失效；新准备的任务仍能使用当前设备', async () => {
   const store = new Store(null); await seedDemo(store); const a = store.state.accounts[0]!;
   const e = new Engine(store,demoFetch), old = await e.prepareDefault(a.id);
-  await e.regenerateDevice(a.id); a.session = demoSession(a);
+  await e.configure(a.id, { device: { ...a.device, androidId: allocateAndroidId(store.state.accounts) } }); a.session = demoSession(a);
   await assert.rejects(e.start(a.id,old),/设备档案已过期/);
   const task = await e.start(a.id,await e.prepareDefault(a.id)); assert.equal(task.phase,'waiting');
-  await assert.rejects(e.regenerateDevice(a.id),/未处理任务/);
+  await assert.rejects(e.configure(a.id, { device: { ...a.device, androidId: allocateAndroidId(store.state.accounts) } }),/未处理任务/);
   assert.equal(task.identity,identity(a));
 });
 
 test('计划准备期间更换设备或删除账号，不会保存过期计划或外发', async () => {
-  for (const change of ['regenerate', 'delete']) {
+  for (const change of ['edit', 'delete']) {
     const store = new Store(null); await seedDemo(store); const a = store.state.accounts[0]!;
     const e = new Engine(store, async () => { throw new Error('must stay offline'); });
     const read = store.getLibrary.bind(store);
@@ -196,7 +198,7 @@ test('计划准备期间更换设备或删除账号，不会保存过期计划�
     };
     const pending = e.queuePlan([a.id], Date.now() + 60_000, 0);
     await entered;
-    if (change === 'regenerate') await e.regenerateDevice(a.id); else await e.deleteAccount(a.id);
+    if (change === 'edit') await e.configure(a.id, { device: { ...a.device, androidId: allocateAndroidId(store.state.accounts) } }); else await e.deleteAccount(a.id);
     release(); await assert.rejects(pending, /账号配置已变化/);
     assert.equal(store.state.tasks.length, 0);
   }

@@ -121,13 +121,13 @@ export class AccountWorkflow {
     const a = this.ui.current();
     const lang = this.lang;
     if (this.ui.view.selected === 0) {
-      if (deviceConflicts(a, this.ui.app.state.accounts).length) {
+      if (a.deviceConflict ?? (deviceConflicts(a, this.ui.app.state.accounts).length > 0)) {
         this.ui.navigate("manage");
         this.ui.view.selected = 3;
         this.ui.view.notice = tr(
           lang,
           "设备标识重复，请在设置中更换。",
-          "Duplicate device ID detected; regenerate in settings.",
+          "Duplicate device ID detected; review account settings.",
         );
         return;
       }
@@ -153,8 +153,8 @@ export class AccountWorkflow {
       isCas
         ? tr(
             lang,
-            "密码或 5 段 CAS Token（统一认证高校也可在记录库按 P/I 从手机备份自动带入登录态）",
-            "Password or 5-part CAS Token (or import phone backup via P/I to auto-sync session)",
+            "密码或 5 段 CAS Token（也可在记录库按 P/I 从手机备份恢复）",
+            "Password or 5-part CAS Token (or restore from phone backup via P/I)",
           )
         : tr(lang, "密码", "Password (never stored on disk)"),
       "",
@@ -326,34 +326,33 @@ export class AccountWorkflow {
     if (this.ui.hasTask(a.id))
       throw new UserError(tr(lang, "账号有未结束任务，请先处理。", "Finish or archive active tasks first."));
     const priv = !!this.ui.app.state.settings.privacyMode;
-    const aid = priv ? maskFixed(a.device.androidId, 16) : a.device.androidId;
-    const imei = priv ? maskFixed(deviceHeaders(a.device).imei, 16) : deviceHeaders(a.device).imei;
+    const inspected = await this.ui.app.commands.inspectDevice(a.id);
+    const current = inspected.device;
+    const aid = priv ? maskFixed(current.androidId, 16) : current.androidId;
+    const imei = priv ? maskFixed(deviceHeaders(current).imei, 16) : deviceHeaders(current).imei;
+    const recovery = inspected.conflict ? tr(lang, " / restore 使用已登记档案", " / restore registered profile") : "";
     const action = await this.ui.ask(
       tr(lang, "独立设备档案", "DEVICE FINGERPRINT"),
       lang === "en"
-        ? `Android ID: ${aid} / imei: ${imei}. Type preset / new / edit, or blank to cancel.`
-        : `Android ID：${aid} / imei：${imei}。preset 选择整套预设；new 换标识；edit 手动修改；留空返回。`,
+        ? `Android ID: ${aid} / imei: ${imei}. Type preset / edit${recovery}, or blank to cancel.`
+        : `Android ID：${aid} / imei：${imei}。preset 选择整套预设；edit 手动修改${recovery}；留空返回。`,
       "",
     );
     if (!action) return;
-    if (action.toLowerCase() === "new") {
-      await this.ui.confirm(
-        tr(lang, "更换本账号设备标识", "ROTATE DEVICE ID"),
-        tr(lang, "更换设备标识后需要重新登录。更换？", "Rotating device ID invalidates the current session. Proceed?"),
-      );
-      const next = await this.ui.app.commands.regenerateDevice(a.id);
-      this.ui.view.notice =
-        lang === "en"
-          ? `New device ID saved (${next.imei}); please sign in again.`
-          : `设备标识已保存：${next.imei}。请重新登录。`;
+    if (action.toLowerCase() === "restore" && inspected.conflict && inspected.registered && inspected.revision) {
+      const device = inspected.registered;
+      const display = priv ? maskFixed(device.androidId, 16) : device.androidId;
+      await this.ui.confirm(tr(lang, "采用已登记档案", "USE REGISTERED DEVICE"),
+        device.model + " · " + display + " · " + tr(lang, "登录态会失效，下次使用可能占用绑定名额。继续？", "Sign-in is required and another slot may be used. Continue?"));
+      await this.ui.app.commands.acceptRegisteredDevice(a.id, inspected.revision);
       return;
     }
     if (action.toLowerCase() === "preset") {
       const key = await this.chooseDevicePreset(false),
-        d = deviceFromPreset(key as DevicePreset, a.device.androidId);
+        d = deviceFromPreset(key as DevicePreset, current.androidId);
       if (
         Object.entries(d).every(
-          ([field, value]) => a.device[field as keyof typeof d] === value,
+          ([field, value]) => current[field as keyof typeof d] === value,
         )
       ) {
         this.ui.view.notice = tr(lang, "已在使用此设备预设。", "Already using this preset.");
@@ -368,9 +367,9 @@ export class AccountWorkflow {
       return;
     }
     if (action.toLowerCase() !== "edit")
-      throw new UserError(tr(lang, "请输入 preset、new、edit 或直接返回。", "Enter preset, new, edit, or leave blank."));
-    const d = structuredClone(a.device);
-    d.androidId = await this.ui.ask("DEVICE", tr(lang, "Android ID（16 位十六进制）", "Android ID (16 hex chars)"), d.androidId);
+      throw new UserError(tr(lang, "请输入 preset、edit 或直接返回。", "Enter preset, edit, or leave blank."));
+    const d = structuredClone(current);
+    d.androidId = await this.ui.ask("DEVICE", tr(lang, "Android ID（16 位十六进制，留空保留）", "Android ID (16 hex chars, blank to keep)"), priv ? "" : d.androidId, priv) || d.androidId;
     d.manufacturer = await this.ui.ask("DEVICE", tr(lang, "厂商 manufacturer", "Manufacturer"), d.manufacturer);
     d.model = await this.ui.ask("DEVICE", tr(lang, "型号 model", "Model"), d.model);
     d.androidRelease = await this.ui.ask("DEVICE", "Android release", d.androidRelease);
@@ -378,7 +377,9 @@ export class AccountWorkflow {
     d.buildId = await this.ui.ask("DEVICE", "Build ID", d.buildId);
     await this.ui.confirm(
       "SAVE PROFILE",
-      `imei=${deviceHeaders(d).imei} — ${tr(lang, "保存后需要重新登录，继续？", "re-login required. Save?")}`,
+      d.androidId !== current.androidId
+        ? tr(lang, "更换标识后，下次使用可能占用额外设备绑定名额，并需要重新登录。继续？", "Using a different ID may use another device slot and requires sign-in. Continue?")
+        : tr(lang, "更改型号字段会使本地会话失效。继续？", "Changing model fields invalidates the local session. Continue?"),
     );
     await this.ui.app.commands.configure(a.id, { device: d });
     this.ui.view.notice = tr(lang, "设备已保存。", "Device profile saved.");
@@ -494,10 +495,14 @@ export class AccountWorkflow {
       tr(lang, "我的运动记录", "My Runs"),
     );
     const l = await this.ui.app.commands.importLibrary(file, label, scope, owner);
-    this.ui.view.notice =
+    let notice =
       lang === "en"
         ? `Decrypted & imported ${l.runCount} valid runs (Routes ${l.routeIds.join("/")}).`
         : `已解密导入 ${l.runCount} 条有效记录（路线 ${l.routeIds.join("/")}）。`;
+    if (l.attribution === 'mismatch')
+      notice += tr(lang, " · 备份归属与所选账号不一致", " · Backup owner differs from selected account");
+    this.ui.view.notice = notice;
+    await this.offerPhoneCandidate(l.id, notice);
   }
 
   async importFromPhone() {
@@ -514,9 +519,70 @@ export class AccountWorkflow {
       tr(lang, "手机提取记录", "Phone Runs"),
     );
     const res = await this.ui.app.commands.importLibraryFromPhone(label, scope, owner);
-    this.ui.view.notice =
+    let notice =
       lang === "en"
         ? `Imported ${res.runCount} valid runs from phone (Routes ${res.routeIds.join("/")}).`
         : `已从${res.sourceHint}解密导入 ${res.runCount} 条有效记录（路线 ${res.routeIds.join("/")}）。`;
+    if (res.attribution === 'mismatch')
+      notice += tr(lang, " · 备份归属与所选账号不一致", " · Backup owner differs from selected account");
+    this.ui.view.notice = notice;
+    await this.offerPhoneCandidate(res.id, notice);
+  }
+
+  private async offerPhoneCandidate(libraryId: string, baseNotice: string) {
+    const lang = this.lang;
+    const candidate = await this.ui.app.commands.inspectPhoneCandidate(libraryId);
+    if (!candidate?.hasDevice) return;
+    if (candidate.matchedAccountId) {
+      const target = this.ui.account(candidate.matchedAccountId);
+      const sessionBroken = !target.session || target.session.status === "invalid";
+      if (candidate.sameDevice && (!candidate.hasSession || !sessionBroken)) return;
+      const promptText = candidate.sameDevice
+        ? tr(
+            lang,
+            `检测到账号 ${candidate.username} 的同设备有效登录态（${candidate.model}），是否直接恢复会话？`,
+            `Valid phone session found for ${candidate.username} (${candidate.model}). Restore session now?`,
+          )
+        : candidate.accountUsed
+          ? tr(
+              lang,
+              `检测到账号 ${candidate.username} 的真机档案（${candidate.model} · ${candidate.displayAndroidId}）。当前账号曾使用其他设备标识；切换为本人真机标识后与手机共用同一名额（互顶不再新增设备）${candidate.hasSession ? "，并可同步恢复登录态" : "，需重新登录"}。是否切换？`,
+              `Phone profile found for ${candidate.username} (${candidate.model} · ${candidate.displayAndroidId}). Switching to your physical phone shares its device slot${candidate.hasSession ? " and restores its session" : " (re-login required)"}. Switch?`,
+            )
+          : tr(
+              lang,
+              `检测到账号 ${candidate.username} 的真机档案（${candidate.model} · ${candidate.displayAndroidId}）${candidate.hasSession ? "及有效登录态" : ""}，是否同步为该账号设备（避免额外占用设备名额）？`,
+              `Phone profile found for ${candidate.username} (${candidate.model} · ${candidate.displayAndroidId})${candidate.hasSession ? " with active session" : ""}. Sync to avoid using an extra device slot?`,
+            );
+      try {
+        await this.ui.confirm(tr(lang, "同步真机设备档案", "SYNC PHONE PROFILE"), promptText);
+      } catch {
+        this.ui.view.notice = baseNotice;
+        return;
+      }
+      const outcome = await this.ui.app.commands.adoptPhoneCandidate(candidate.matchedAccountId, libraryId, true);
+      const suffix = outcome.sessionRestored
+        ? tr(lang, " · 已同步真机设备与登录态", " · Phone device & session synced")
+        : outcome.deviceChanged
+          ? tr(lang, " · 已同步真机设备（请重新登录）", " · Phone device synced (sign in again)")
+          : tr(lang, " · 已标记真机设备", " · Marked as phone device");
+      this.ui.view.notice = baseNotice + suffix;
+      return;
+    }
+    try {
+      await this.ui.confirm(
+        tr(lang, "预登记真机设备档案", "STAGE PHONE PROFILE"),
+        tr(
+          lang,
+          `备份含账号 ${candidate.username} 的真机档案（${candidate.model} · ${candidate.displayAndroidId}）。是否预先登记到本机注册表（稍后添加该账号时自动采用真机标识）？`,
+          `Backup contains phone profile for ${candidate.username} (${candidate.model} · ${candidate.displayAndroidId}). Stage it so adding this account later automatically uses your phone ID?`,
+        ),
+      );
+    } catch {
+      this.ui.view.notice = baseNotice;
+      return;
+    }
+    await this.ui.app.commands.stagePhoneCandidate(libraryId);
+    this.ui.view.notice = baseNotice + tr(lang, " · 已预登记真机设备", " · Phone device staged");
   }
 }

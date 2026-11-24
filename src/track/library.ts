@@ -1,7 +1,9 @@
 import { readFile, realpath, stat } from 'node:fs/promises';
 import { dirname, resolve, relative, isAbsolute } from 'node:path';
 import { randomInt, randomUUID } from 'node:crypto';
-import { loadAnySportSource, pullSportDatasetFromPhone, stripInputQuotes, type ExtractedAndroidSession } from '../campus/android-import.js';
+import { loadAnySportSource, pullSportDatasetFromPhone, stripInputQuotes } from '../campus/android-import.js';
+import type { BackupHints } from '../campus/backup-snapshot.js';
+import { deviceProfiles } from '../core/device-profiles.js';
 import { perturbRun, replayRecordToUploadJsonSports } from './mapper.js';
 import type { RouteConfig, RunRecord } from './types.js';
 import { alignBodyToNow } from '../protocol/align.js';
@@ -9,6 +11,7 @@ import { generateSensor } from '../protocol/sensor.js';
 import { validateSaveJson } from '../protocol/validate.js';
 import { identity, phoneVersion, UserError, type Account, type Library, type Prepared, type SourceMode, type OneShotTargets } from '../core/model.js';
 import type { Store } from '../runtime/storage.js';
+import { distanceMeters } from './geo.js';
 import { fitRun, validateTargets, durationText } from './fit.js';
 
 export interface LibraryData { runs: RunRecord[]; sensors: Record<string, number[]>; routes?: RouteConfig[] }
@@ -19,49 +22,38 @@ async function readJson(path: string) {
   if ((await stat(path)).size > 80_000_000) throw new UserError('导入文件超过 80MB。');
   try { return JSON.parse(await readFile(path, 'utf8')); } catch { throw new UserError('数据文件不是有效 JSON。'); }
 }
-function hydrateAccountSessionFromBackup(store: Store, session: ExtractedAndroidSession | undefined, ownerId?: string) {
-  if (!session?.token || !session.secret) return;
-  const target = store.state.accounts.find(a =>
-    (!a.session || a.session.status === 'invalid') &&
-    ((session.xh && a.username === session.xh) || (ownerId && a.id === ownerId && !session.xh)),
-  );
-  if (!target) return;
-  target.session = {
-    id: randomUUID(),
-    token: session.token,
-    secret: session.secret,
-    loginOutTime: session.loginOutTime,
-    xh: target.username,
-    name: session.name ?? '',
-    gender: session.gender ?? '1',
-    identity: identity(target),
-    createdAt: Date.now(),
-    status: 'saved',
-  };
+function libraryOrigin(store: Store, scope: SourceMode, owner?: string, hints?: BackupHints): Partial<Library> {
+  const account = scope === 'private' ? store.state.accounts.find(a => a.id === owner) : undefined;
+  const serverUrl = hints?.serverUrl;
+  const enrolled = store.state.accounts.map(a => a.school);
+  const unique = new Set(enrolled.map(s => s.baseUrl)).size === 1 ? enrolled[0] : undefined;
+  const school = serverUrl ? enrolled.find(s => s.baseUrl === serverUrl) : account?.school ?? unique;
+  const metadata = { schoolBaseUrl: serverUrl ?? school?.baseUrl, schoolName: school?.name,
+    ...(scope === 'private' && account ? { schoolId: account.school.id } : {}) };
+  if (!account || !serverUrl || !hints?.username) return { ...metadata, attribution: 'unverified' };
+  if (account.school.baseUrl !== serverUrl || account.username !== hints.username) return { ...metadata, attribution: 'mismatch' };
+  const preset = Object.values(deviceProfiles).find(p => p.model === hints.model);
+  return { ...metadata, attribution: 'matched', ...(preset ? { modelHint: preset.model } : {}) };
 }
 
-function resolveLibrarySchoolMeta(store: Store, owner?: string): { schoolBaseUrl?: string; schoolName?: string } {
-  const ownerAcc = owner ? store.state.accounts.find(a => a.id === owner) : undefined;
-  const uniqBases = [...new Set(store.state.accounts.map(a => a.school.baseUrl).filter(Boolean))];
-  const ref = ownerAcc?.school ?? (uniqBases.length === 1 ? store.state.accounts[0]?.school : undefined);
-  if (!ref) return {};
-  return {
-    // 仅对真实第三方校区网关标记归属，避免通用离线测试桩受影响
-    ...(ref.baseUrl && ref.baseUrl !== 'https://cgapp.chingo.cn/cgapp-server/' ? { schoolBaseUrl: ref.baseUrl } : {}),
-    ...(ref.name ? { schoolName: ref.name } : {}),
-  };
-}
-
-export async function importLibrary(store: Store, file: string, label: string, scope: SourceMode, owner?: string): Promise<Library> {
+export async function importLibrary(
+  store: Store,
+  file: string,
+  label: string,
+  scope: SourceMode,
+  owner?: string,
+  onHints?: (hints: BackupHints | undefined) => void,
+): Promise<Library> {
   if (scope === 'private' && !store.state.accounts.some(a => a.id === owner)) throw new UserError('私有记录库必须选择所属账号。');
   const cleanedFile = stripInputQuotes(file);
-  const { dataset: parsed, sensors: rawSensors, session: backupSession } = await loadAnySportSource(cleanedFile);
-  hydrateAccountSessionFromBackup(store, backupSession, owner);
+  const { dataset: parsed, sensors: rawSensors, hints } = await loadAnySportSource(cleanedFile);
   const sensors: Record<string, number[]> = { ...rawSensors };
   try {
     const resolvedPath = await realpath(cleanedFile);
-    const root = dirname(resolvedPath);
-    const manifest = await readJson(resolve(root, 'sensor_manifest.json')) as { items: Array<{ matchedRunId: number; url: string }> };
+    const root = (await stat(resolvedPath)).isDirectory() ? resolvedPath : dirname(resolvedPath);
+    const manifestFile = await realpath(resolve(root, 'sensor_manifest.json'));
+    if (dirname(manifestFile) !== root) throw new Error('manifest outside import directory');
+    const manifest = await readJson(manifestFile) as { items: Array<{ matchedRunId: number; url: string }> };
     if (Array.isArray(manifest.items)) for (const item of manifest.items) {
       if (!Number.isFinite(item.matchedRunId) || typeof item.url !== 'string' || !item.url.startsWith('/data/sensors/')) continue;
       const candidate = await realpath(resolve(root, item.url.slice('/data/'.length)));
@@ -71,21 +63,27 @@ export async function importLibrary(store: Store, file: string, label: string, s
       if (Array.isArray(arr) && arr.length < 100_000 && arr.every(v => typeof v === 'number' && Number.isFinite(v))) sensors[String(item.matchedRunId)] = arr;
     }
   } catch { /* 可选本地传感器没有时沿用已有 One-Shot 的生成路径。 */ }
-  const schoolMeta = resolveLibrarySchoolMeta(store, owner);
+  const schoolMeta = libraryOrigin(store, scope, owner, hints);
   const library: Library = { id: randomUUID(), label, scope, ...(scope === 'private' ? { ownerAccountId: owner } : {}),
     ...schoolMeta,
     runCount: parsed.runs.length, routeIds: [...new Set(parsed.runs.map(r => r.routeId!))], importedAt: Date.now() };
   const routes = Array.isArray(parsed.routes) ? parsed.routes : undefined;
   await store.putLibrary(library.id, { runs: parsed.runs, sensors, ...(routes ? { routes } : {}) } satisfies LibraryData);
   store.state.libraries.push(library); await store.save();
+  onHints?.(hints);
   return library;
 }
 
-export async function importLibraryFromPhone(store: Store, label: string, scope: SourceMode, owner?: string): Promise<Library & { sourceHint: string }> {
+export async function importLibraryFromPhone(
+  store: Store,
+  label: string,
+  scope: SourceMode,
+  owner?: string,
+  onHints?: (hints: BackupHints | undefined) => void,
+): Promise<Library & { sourceHint: string }> {
   if (scope === 'private' && !store.state.accounts.some(a => a.id === owner)) throw new UserError('私有记录库必须选择所属账号。');
-  const { dataset: parsed, sensors, sourceHint, session: backupSession } = await pullSportDatasetFromPhone();
-  hydrateAccountSessionFromBackup(store, backupSession, owner);
-  const schoolMeta = resolveLibrarySchoolMeta(store, owner);
+  const { dataset: parsed, sensors, sourceHint, hints } = await pullSportDatasetFromPhone();
+  const schoolMeta = libraryOrigin(store, scope, owner, hints);
   const library: Library = {
     id: randomUUID(),
     label,
@@ -100,6 +98,7 @@ export async function importLibraryFromPhone(store: Store, label: string, scope:
   await store.putLibrary(library.id, { runs: parsed.runs, sensors, ...(routes ? { routes } : {}) } satisfies LibraryData);
   store.state.libraries.push(library);
   await store.save();
+  onHints?.(hints);
   return { ...library, sourceHint };
 }
 
@@ -119,7 +118,7 @@ export async function prepareOneShot(store: Store, a: Account, libraryId: string
   const custom = options.distanceKm !== undefined || options.durationSec !== undefined;
   const reconstruct = custom || options.mode !== 'legacy';
   let pool = custom ? sameRoute : preferred.length ? preferred : sameRoute;
-  if (!pool.length) throw new UserError('该记录库没有符合条件的同路线样本。');
+  if (!pool.length) throw new UserError('该记录库没有符合条件的同路线样本。请检查路线、来源里程和有效坐标数量。');
   if (options.runId !== undefined) { pool = pool.filter(r => r.id === options.runId); if (!pool.length) throw new UserError('诊断样本不在符合条件的同路线池中。'); }
   let seed = options.seed ?? randomInt(10_000, 100_000);
   if (options.seed === undefined && seed === options.avoidSeed) seed = seed === 99999 ? 10000 : seed + 1;
@@ -150,7 +149,7 @@ export async function prepareOneShot(store: Store, a: Account, libraryId: string
     candidateCount = candidates.length;
     if (!candidateCount) {
       const distances = pool.map(r => r.distanceKm!), times = pool.map(r => r.durationSec ?? 0);
-      throw new UserError(`没有支持此目标的同路线样本。来源 ${Math.min(...distances).toFixed(2)}–${Math.max(...distances).toFixed(2)} km / ${durationText(Math.min(...times))}–${durationText(Math.max(...times))}。${[...failures].slice(0, 2).join('；')}`);
+      throw new UserError(`同路线 ${pool.length} 个候选中没有支持此目标的样本。来源 ${Math.min(...distances).toFixed(2)}–${Math.max(...distances).toFixed(2)} km / ${durationText(Math.min(...times))}–${durationText(Math.max(...times))}。${[...failures].slice(0, 2).join('；')}`);
     }
     candidates.sort((a, b) => a.score - b.score);
     const near = custom ? candidates.slice(0, 3) : candidates, different = near.filter(c => c.source.id !== options.avoidRunId), choices = different.length ? different : near;
@@ -180,9 +179,20 @@ export async function prepareOneShot(store: Store, a: Account, libraryId: string
   if (!sensor.length) sensor = generateSensor({ durationSec, stepMinute: Number(body.stepMinute) || 145, ...(reconstruct ? { rngSeed: seed } : {}) });
   const errors = validateSaveJson({ ...body, sportId: 'PRECHECK-SID' }, { sensorSampleCount: sensor.length });
   if (errors.length) throw new UserError(`本地预检未通过：${errors.slice(0, 2).join('；')}`);
+  // Diagnostic only. Exclude gaps, invalid fixes and initialization points. Never bridge a gap.
+  let rawGeometryMeters = 0, segments = 0;
+  for (let i = 1; i < chosen.points.length; i++) {
+    const a = chosen.points[i - 1]!, b = chosen.points[i]!;
+    if (a.validFlag === 1 && b.validFlag === 1 && (a.timestampMs ?? 0) > 0 && (b.timestampMs ?? 0) > 0) {
+      rawGeometryMeters += distanceMeters([a.latGcj02!, a.lngGcj02!], [b.latGcj02!, b.lngGcj02!]);
+      segments++;
+    }
+  }
   return {
+    ...(segments ? { rawGeometryMeters } : {}),
+    ...(!segments ? { rawGeometryCoverage: 'unavailable' as const } : segments < chosen.points.length - 2 ? { rawGeometryCoverage: 'partial' as const } : {}),
     body, sensor, routeId: a.routeId, libraryId, sourceRunId: chosen.id, sourceDistanceKm: chosen.distanceKm ?? undefined, sourceDurationSec: chosen.durationSec ?? undefined,
-    candidateCount, accountIdentity: identity(a), seed, durationSec, sensorSource, generation: custom ? 'manual' : reconstruct ? 'auto' : 'legacy',
+    candidateCount, accountIdentity: identity(a), ...(a.deviceRevision ? { deviceRevision: a.deviceRevision } : {}), ...(a.session ? { preparedSessionId: a.session.id } : {}), seed, durationSec, sensorSource, generation: custom ? 'manual' : reconstruct ? 'auto' : 'legacy',
     ...(custom ? { targets } : {}), ...(fitted ? { fit: { sourceWindowSec: fitted.sourceWindowSec, timeScale: fitted.timeScale } } : {}),
   };
 }

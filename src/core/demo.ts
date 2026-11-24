@@ -42,6 +42,8 @@ export const demoFetch: typeof fetch = async (input, init) => {
   const en = currentDemoLang === 'en';
   const parsedUrl = new URL(String(input)), path = parsedUrl.pathname;
   const ok = (data: unknown) => Response.json({ code: 200, message: 'demo', data }, { headers: { Date: new Date().toUTCString() } });
+  if (path.endsWith('/getConfig')) return ok({ app_imei_account: 4, app_account_imei: 4 });
+  if (path.endsWith('/u/info')) return ok({ xh: parsedUrl.searchParams.get('xh') ?? '', xm: en ? 'Demo Student' : '演示同学', xb: '1' });
   if (path.endsWith('/version')) return ok('当前已是最新版本');
   if (path.endsWith('/school')) return ok([
     { id: 99, cnName: '演示大学', enName: 'Demo University', code: 'DEMO', provinceCode: '00', randomCode: '00', serverUrl: 'https://cgapp.chingo.cn/cgapp-server/' },

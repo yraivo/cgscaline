@@ -35,6 +35,7 @@ import {
   type WorkerAddress,
 } from "./ipc.js";
 import { Store, WindowsVault, unlockStale } from "./storage.js";
+import { registryForWorker } from "./device-registry.js";
 import { TaskScheduler } from "./task-scheduler.js";
 
 const methods = new Set<string>(commandNames);
@@ -90,7 +91,7 @@ export async function runWorker(
   }
   if (demo) store.state.runtimeMode = "demo";
   const demoSupport = demo ? await import("../core/demo.js") : undefined;
-  const engine = new Engine(store, demoSupport?.demoFetch);
+  const engine = new Engine(store, demoSupport?.demoFetch, registryForWorker(demo));
   const sockets = new Set<Socket>();
   let revision = 0,
     stopping = false,
@@ -99,7 +100,7 @@ export async function runWorker(
   const snapshot = (): Snapshot => ({
     revision: ++revision,
     state: appState(store.state),
-    viewVersion: 2,
+    viewVersion: 3,
     notices: engine.startupNotices,
   });
   const notifier = new TaskNotifications(
@@ -340,7 +341,10 @@ export async function runWorker(
       store.state.tasks.some((t) => ["paused", "review"].includes(t.phase))
     )
       desktopNotify("有暂停或待核对任务，打开 CGSCALINE → 任务处理。");
-    return { engine, address, close: signal };
+    return { engine, address, close: async () => {
+      signal(); await commandQueue;
+      if (!closed) throw new UserError("后台关闭失败。");
+    } };
   } catch (e) {
     store.close();
     server.close();

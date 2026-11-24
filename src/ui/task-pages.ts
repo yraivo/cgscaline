@@ -23,7 +23,7 @@ export function taskPageActions(view: RenderView, state: AppState, demo: boolean
     const account = state.accounts.find(a => a.id === task.accountId);
     const session = account?.session;
     const usable = account && session && session.status !== 'invalid'
-      && session.xh === account.username && session.identity === identity(account);
+      && session.xh === account.username && session.identity === (account.profileIdentity ?? identity(account));
     const running = state.tasks.filter(t => ['starting', 'waiting', 'committing'].includes(t.phase));
     const bound = usable && (!task.prepared.accountIdentity || task.prepared.accountIdentity === session.identity);
     const queued = task.resumePhase === 'queued';

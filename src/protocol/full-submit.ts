@@ -16,7 +16,7 @@ import { gzipSync } from "node:zlib";
 import { NativeSigner, MockSigner, ReplaySigner, type Signer } from "./signer.js";
 import { NativeEncoder, PassthroughEncoder, type BodyEncoder } from "./encoder.js";
 import { sportsId, saveSports, uploadSensorZip, prejudgment } from "./endpoint.js";
-import { androidIdToImei, buildUserAgent, buildV1 } from "./device.js";
+import { buildUserAgent, buildV1 } from "./device.js";
 import { buildPrejudgmentSnapshot, assertSnapshotInvariants } from "./prejudgment.js";
 import { auditedRequest } from "./outbound-trace.js";
 import {
@@ -39,7 +39,7 @@ export interface SessionHeaders {
 }
 
 export const DEFAULT_SESSION_HEADERS: SessionHeaders = {
-  imei: androidIdToImei("c1f2d3e4a5b67890"),
+  imei: "",
   // v1 每次请求动态 = MD5(now_ms)（signRequest 内生成；显式 session.v1 时优先）
   v1: "",
   client: "",
@@ -216,6 +216,8 @@ export async function handleFullSubmit(
 
   // 有 SECRET 且未显式指定自定义 client 时，动态生成（AES-ECB(JSON{heap,root,t}, SECRET[:16])）
   // 更"像真机"：client 每次请求都随 t 变化（真实 App 行为一致）。
+  if (!config.session?.imei?.trim() || !config.session.userAgent || (config.imei && config.imei !== config.session.imei))
+    return { ok: false, error: "账号设备档案缺失或不匹配。", status: 400 };
   const explicitClient =
     config.session?.client && config.session.client !== DEFAULT_SESSION_HEADERS.client;
   const session: SessionHeaders = {

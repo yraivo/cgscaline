@@ -158,8 +158,7 @@ test('修复 2：我的记录「本学期」在真实后台 Worker IPC 下按 R 
 
     await ui.close();
   } finally {
-    if (worker) worker.close();
-    await new Promise(r => setTimeout(r, 150));
+    if (worker) await worker.close();
     await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });

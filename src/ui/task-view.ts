@@ -1,5 +1,6 @@
 import type { TaskView, AppState, AccountView } from '../app/contracts.js';
-import { cachedInformation, type Account, type Language, type Task } from '../core/model.js';
+import { cachedInformation } from './information-view.js';
+import { type Account, type Language, type Task } from '../core/model.js';
 import type { InvalidReason } from '../campus/information.js';
 import { geometryWarnings } from '../track/geometry.js';
 import { maskFixed, maskText } from '../core/privacy.js';

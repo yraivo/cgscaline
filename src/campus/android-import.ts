@@ -1,11 +1,12 @@
 import { spawn, execFileSync } from 'node:child_process';
 import { createDecipheriv, pbkdf2Sync, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, readdir, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, realpath, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, dirname, extname, join, resolve } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { inflateRawSync, inflateSync } from 'node:zlib';
 import type { Dataset, GcjCoord, RouteConfig, RunRecord } from '../track/types.js';
+import { SnapshotCollector, backupHints, parseSensorText, type BackupHints, type SportSnapshot } from './backup-snapshot.js';
 import { UserError } from '../core/model.js';
 
 function loadNodeSqlite() {
@@ -52,21 +53,7 @@ export function parseBoundaryString(raw: unknown): GcjCoord[] | undefined {
   return pts.length >= 3 ? pts : undefined;
 }
 
-export function parseSensorText(raw: string): number[] | undefined {
-  const trimmed = raw.trim();
-  if (!trimmed) return undefined;
-  const body = trimmed.replace(/^\[+/, '').replace(/\]+$/, '');
-  const nums: number[] = [];
-  for (const part of body.split(',')) {
-    const s = part.trim();
-    if (!s) continue;
-    const v = Number(s);
-    if (!Number.isFinite(v)) return undefined;
-    nums.push(v);
-    if (nums.length >= 100_000) return undefined;
-  }
-  return nums.length >= 10 ? nums : undefined;
-}
+export { parseSensorText } from './backup-snapshot.js';
 
 export function decryptWcdbBuffer(data: Buffer, password = DEFAULT_WCDB_KEY): Buffer {
   if (data.length >= 16 && data.subarray(0, 16).equals(SQLITE_MAGIC)) {
@@ -105,7 +92,7 @@ function readAsciiLine(buf: Buffer, pos: number): [string, number] {
   return [buf.subarray(pos, nl).toString('ascii').trim(), nl + 1];
 }
 
-export function unpackAndroidBackupToTar(data: Buffer): Buffer {
+export function unpackAndroidBackupToTar(data: Buffer, limit = 512 * 1024 * 1024): Buffer {
   const magicIdx = data.indexOf(ANDROID_BACKUP_MAGIC);
   if (magicIdx < 0) throw new UserError('未识别的安卓备份包格式。');
   let pos = magicIdx + ANDROID_BACKUP_MAGIC.length;
@@ -116,12 +103,13 @@ export function unpackAndroidBackupToTar(data: Buffer): Buffer {
     throw new UserError('该备份包设置了加密密码；请使用未设密码的本地备份。');
   }
   const payload = data.subarray(pos);
+  if (limit <= 0 || (compressed === '0' && payload.length > limit)) throw new UserError('备份解压预算已用尽。');
   if (!payload.length) {
     throw new UserError('备份包内容为空（手机可能未确认备份或系统限制了 ADB 备份）。');
   }
   if (compressed === '1') {
     try {
-      return inflateSync(payload, { maxOutputLength: 512 * 1024 * 1024 });
+      return inflateSync(payload, { maxOutputLength: limit });
     } catch {
       throw new UserError('解压安卓备份包失败，文件可能已损坏。');
     }
@@ -140,53 +128,11 @@ function parseTarOctal(buf: Buffer): number {
   return s ? parseInt(s, 8) : 0;
 }
 
-export interface ExtractedAndroidSession {
-  token: string;
-  secret: string;
-  loginOutTime: string;
-  xh?: string;
-  name?: string;
-  gender?: string;
-}
-
-function parseSharedPrefsStringMap(xml: string): Record<string, string> {
-  const out: Record<string, string> = {};
-  const re = /<string\s+name="([^"]+)">([^<]*)<\/string>/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(xml)) !== null) {
-    out[m[1]!] = m[2]!.trim();
-  }
-  return out;
-}
-
-function buildExtractedSession(headerXml?: string, userXml?: string): ExtractedAndroidSession | undefined {
-  if (!headerXml) return undefined;
-  const h = parseSharedPrefsStringMap(headerXml);
-  if (!h.TOKEN || !h.SECRET || h.SECRET.length < 16) return undefined;
-  const u = userXml ? parseSharedPrefsStringMap(userXml) : {};
-  return {
-    token: h.TOKEN,
-    secret: h.SECRET,
-    loginOutTime: h.LOGIN_OUT_TIME || String(Date.now() + 30 * 86_400_000),
-    ...(u.USERXH ? { xh: u.USERXH } : {}),
-    ...(u.USERNAME ? { name: u.USERNAME } : {}),
-    ...(u.USER_SEX ? { gender: u.USER_SEX } : {}),
-  };
-}
-
-export function extractSportFilesFromTar(tar: Buffer): {
-  db?: Buffer;
-  sensors: Map<string, number[]>;
-  session?: ExtractedAndroidSession;
-} {
+export function extractSportFilesFromTar(tar: Buffer): SportSnapshot {
+  const collector = new SnapshotCollector();
   let offset = 0;
   let nextLongName = '';
   let paxPath = '';
-  let db: Buffer | undefined;
-  let headerXml: string | undefined;
-  let userXml: string | undefined;
-  const sensors = new Map<string, number[]>();
-
   while (offset + 512 <= tar.length) {
     const header = tar.subarray(offset, offset + 512);
     offset += 512;
@@ -224,29 +170,14 @@ export function extractSportFilesFromTar(tar: Buffer): {
     nextLongName = '';
     paxPath = '';
 
-    if (/(?:^|\/)ygty_mysport\.db$/i.test(fullPath)) {
-      db = Buffer.from(data);
-    } else if (/(?:^|\/)sp\/HEADER\.xml$/i.test(fullPath) && size > 20 && size < 65_536) {
-      headerXml = data.toString('utf8');
-    } else if (/(?:^|\/)sp\/USERINFO\.xml$/i.test(fullPath) && size > 20 && size < 65_536) {
-      userXml = data.toString('utf8');
-    } else {
-      const m = /(?:^|\/)sensor(?:_log)?\/([a-zA-Z0-9_-]{8,80})\.txt$/i.exec(fullPath);
-      if (m && size > 10 && size < 4_000_000) {
-        const parsed = parseSensorText(data.toString('utf8'));
-        if (parsed) sensors.set(m[1]!, parsed);
-      }
-    }
+    if (typeFlag === '0') collector.add(fullPath, size, () => data);
   }
-  const session = buildExtractedSession(headerXml, userXml);
-  return { db, sensors, ...(session ? { session } : {}) };
+  return collector.finish();
 }
 
-export function extractSportFilesFromZip(zip: Buffer): {
-  db?: Buffer;
-  sensors: Map<string, number[]>;
-  session?: ExtractedAndroidSession;
-} {
+export function extractSportFilesFromZip(zip: Buffer): SportSnapshot {
+  const collector = new SnapshotCollector();
+  let remaining = 512 * 1024 * 1024;
   // Locate End of Central Directory (EOCD: 0x06054b50)
   const minPos = Math.max(0, zip.length - 65_558);
   let eocd = -1;
@@ -261,12 +192,6 @@ export function extractSportFilesFromZip(zip: Buffer): {
 
   let pos = cdOffset;
   const cdEnd = cdOffset + cdSize;
-  let db: Buffer | undefined;
-  let session: ExtractedAndroidSession | undefined;
-  let headerXml: string | undefined;
-  let userXml: string | undefined;
-  const sensors = new Map<string, number[]>();
-
   const readEntry = (compMethod: number, compSize: number, uncompSize: number, localOffset: number): Buffer => {
     if (localOffset + 30 > zip.length || zip.readUInt32LE(localOffset) !== 0x04034b50) {
       throw new UserError('ZIP 文件条目头损坏。');
@@ -276,9 +201,14 @@ export function extractSportFilesFromZip(zip: Buffer): {
     const dataStart = localOffset + 30 + fnLen + extraLen;
     if (dataStart + compSize > zip.length) throw new UserError('ZIP 条目数据不完整。');
     const slice = zip.subarray(dataStart, dataStart + compSize);
-    if (compMethod === 0) return slice;
-    if (compMethod === 8) return inflateRawSync(slice, { maxOutputLength: Math.max(uncompSize + 1024, 512 * 1024 * 1024) });
-    throw new UserError(`不支持的 ZIP 压缩算法（method=${compMethod}）。`);
+    if (uncompSize > remaining || (compMethod === 0 && slice.length !== uncompSize)) throw new UserError('ZIP 解压长度或预算无效。');
+    let data: Buffer;
+    if (compMethod === 0) data = slice;
+    else if (compMethod === 8) data = inflateRawSync(slice, { maxOutputLength: Math.max(1, Math.min(remaining, uncompSize)) });
+    else throw new UserError('不支持的 ZIP 压缩算法。');
+    if (data.length !== uncompSize) throw new UserError('ZIP 条目解压长度不一致。');
+    remaining -= data.length;
+    return data;
   };
 
   while (pos + 46 <= cdEnd) {
@@ -293,29 +223,18 @@ export function extractSportFilesFromZip(zip: Buffer): {
     const entryName = zip.subarray(pos + 46, pos + 46 + nameLen).toString('utf8').replace(/\\/g, '/');
     pos += 46 + nameLen + extraLen + commentLen;
 
-    if (/(?:^|\/)ygty_mysport\.db$/i.test(entryName)) {
-      db = readEntry(compMethod, compSize, uncompSize, localOffset);
-    } else if (/(?:^|\/)sp\/HEADER\.xml$/i.test(entryName) && uncompSize > 20 && uncompSize < 65_536) {
-      headerXml = readEntry(compMethod, compSize, uncompSize, localOffset).toString('utf8');
-    } else if (/(?:^|\/)sp\/USERINFO\.xml$/i.test(entryName) && uncompSize > 20 && uncompSize < 65_536) {
-      userXml = readEntry(compMethod, compSize, uncompSize, localOffset).toString('utf8');
-    } else if (/\.(?:bak|ab|tar)$/i.test(entryName) && uncompSize > 512 && uncompSize < 512 * 1024 * 1024) {
-      const inner = readEntry(compMethod, compSize, uncompSize, localOffset);
-      const tar = inner.indexOf(ANDROID_BACKUP_MAGIC) >= 0 ? unpackAndroidBackupToTar(inner) : inner;
-      const res = extractSportFilesFromTar(tar);
-      if (res.db) db = res.db;
-      if (res.session) session = res.session;
-      for (const [k, v] of res.sensors) sensors.set(k, v);
-    } else {
-      const m = /(?:^|\/)sensor(?:_log)?\/([a-zA-Z0-9_-]{8,80})\.txt$/i.exec(entryName);
-      if (m && uncompSize > 10 && uncompSize < 4_000_000) {
-        const parsed = parseSensorText(readEntry(compMethod, compSize, uncompSize, localOffset).toString('utf8'));
-        if (parsed) sensors.set(m[1]!, parsed);
+    const read = () => readEntry(compMethod, compSize, uncompSize, localOffset);
+    if (/\.(?:bak|ab|tar)$/i.test(entryName) && uncompSize > 512) {
+      const inner = read();
+      let tar = inner;
+      if (inner.subarray(0, 4096).indexOf(ANDROID_BACKUP_MAGIC) >= 0) {
+        tar = unpackAndroidBackupToTar(inner, remaining);
+        remaining -= tar.length;
       }
-    }
+      collector.addNested(extractSportFilesFromTar(tar));
+    } else collector.add(entryName, uncompSize, read);
   }
-  session ??= buildExtractedSession(headerXml, userXml);
-  return { db, sensors, ...(session ? { session } : {}) };
+  return collector.finish();
 }
 
 function numOrNull(v: unknown): number | null {
@@ -548,18 +467,47 @@ export async function extractDatasetFromSqliteBuffer(
   }
 }
 
+async function contained(root: string, file: string) {
+  const canonical = await realpath(file);
+  const rel = relative(root, canonical);
+  if (rel === '..' || rel.startsWith('..' + sep) || isAbsolute(rel)) throw new UserError('备份文件超出所选目录。');
+  return canonical;
+}
+
+async function folderHints(root: string): Promise<BackupHints | undefined> {
+  const prefs = new Map<string, string>();
+  for (const folder of ['sp', 'shared_prefs']) for (const key of ['USERINFO', 'SCHOOL', 'HEADER', 'umzid_general_config']) {
+    try {
+      const file = await contained(root, join(root, folder, key + '.xml'));
+      if (prefs.has(key) || (await stat(file)).size > 65536) return;
+      prefs.set(key, await readFile(file, 'utf8'));
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return; }
+  }
+  let umengCache: Buffer | undefined;
+  for (const folder of ['f', 'files']) {
+    try {
+      const file = await contained(root, join(root, folder, 'umeng_it.cache'));
+      const st = await stat(file);
+      if (umengCache || st.size <= 0 || st.size > 65536) return;
+      umengCache = await readFile(file);
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return; }
+  }
+  return backupHints(prefs, umengCache);
+}
+
 async function scanNearbySensorDir(baseDir: string, out: Map<string, number[]>) {
   for (const sub of ['sensor', 'sensor_log', 'sensors', join('sensor', 'sensor'), join('files', 'sensor')]) {
     const dir = resolve(baseDir, sub);
     try {
-      const entries = await readdir(dir, { withFileTypes: true });
+      const entries = await readdir(await contained(baseDir, dir), { withFileTypes: true });
       for (const entry of entries) {
         if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.txt')) continue;
         const stem = entry.name.slice(0, -4);
         if (out.has(stem) || !/^[a-zA-Z0-9_-]{8,80}$/.test(stem)) continue;
-        const st = await stat(join(dir, entry.name));
+        const file = await contained(baseDir, join(dir, entry.name));
+        const st = await stat(file);
         if (st.size > 10 && st.size < 4_000_000) {
-          const parsed = parseSensorText(await readFile(join(dir, entry.name), 'utf8'));
+          const parsed = parseSensorText(await readFile(file, 'utf8'));
           if (parsed) out.set(stem, parsed);
         }
       }
@@ -569,9 +517,9 @@ async function scanNearbySensorDir(baseDir: string, out: Map<string, number[]>) 
   }
 }
 
-async function findSportFileInDir(dir: string, depth = 0): Promise<string | undefined> {
+async function findSportFileInDir(dir: string, root: string, depth = 0): Promise<string | undefined> {
   if (depth > 5) return undefined;
-  const entries = await readdir(dir, { withFileTypes: true });
+  const entries = await readdir(await contained(root, dir), { withFileTypes: true });
   for (const e of entries) {
     if (e.isFile() && /^ygty_mysport(?:_decrypted)?\.db$/i.test(e.name)) return join(dir, e.name);
   }
@@ -582,7 +530,7 @@ async function findSportFileInDir(dir: string, depth = 0): Promise<string | unde
   }
   for (const e of entries) {
     if (e.isDirectory() && !e.name.startsWith('.') && e.name !== 'node_modules') {
-      const found = await findSportFileInDir(join(dir, e.name), depth + 1);
+      const found = await findSportFileInDir(join(dir, e.name), root, depth + 1);
       if (found) return found;
     }
   }
@@ -592,7 +540,7 @@ async function findSportFileInDir(dir: string, depth = 0): Promise<string | unde
 export async function loadAnySportSource(rawPath: string): Promise<{
   dataset: Dataset;
   sensors: Record<string, number[]>;
-  session?: ExtractedAndroidSession;
+  hints?: BackupHints;
 }> {
   const cleanedPath = stripInputQuotes(rawPath);
   if (!cleanedPath) throw new UserError('文件路径不能为空。');
@@ -603,10 +551,12 @@ export async function loadAnySportSource(rawPath: string): Promise<{
   } catch {
     throw new UserError(`找不到文件或目录：${cleanedPath}`);
   }
-  if (st.isDirectory()) {
-    const inner = await findSportFileInDir(targetPath);
+  targetPath = await realpath(targetPath);
+  const selectedRoot = st.isDirectory() ? targetPath : undefined;
+  if (selectedRoot) {
+    const inner = await findSportFileInDir(selectedRoot, selectedRoot);
     if (!inner) throw new UserError('所选文件夹内未找到 ygty_mysport.db、手机备份包 (.bak/.zip) 或 JSON 数据集。');
-    targetPath = inner;
+    targetPath = await contained(selectedRoot, inner);
     st = await stat(targetPath);
   }
   if (st.size > 350_000_000) throw new UserError('文件超过 350MB 上限。');
@@ -614,35 +564,37 @@ export async function loadAnySportSource(rawPath: string): Promise<{
   const buf = await readFile(targetPath);
   const ext = extname(targetPath).toLowerCase();
   const nearbySensors = new Map<string, number[]>();
-  await scanNearbySensorDir(dirname(targetPath), nearbySensors);
-  await scanNearbySensorDir(dirname(dirname(targetPath)), nearbySensors);
+  const dbDir = dirname(targetPath);
+  const packageDir = ext === '.db' && /^(?:db|databases)$/i.test(basename(dbDir)) &&
+    (!selectedRoot || selectedRoot !== dbDir) ? dirname(dbDir) : dbDir;
+  if (ext === '.json' || ext === '.db') await scanNearbySensorDir(packageDir, nearbySensors);
 
   // 1. ZIP archive (e.g., MIUI backup zip)
   if (buf.length >= 4 && buf.subarray(0, 4).equals(ZIP_MAGIC)) {
-    const { db, sensors, session } = extractSportFilesFromZip(buf);
+    const { db, sensors, hints } = extractSportFilesFromZip(buf);
     if (!db) throw new UserError('ZIP 压缩包内未找到创高体育数据库 (ygty_mysport.db)。');
     for (const [k, v] of sensors) nearbySensors.set(k, v);
     const out = await extractDatasetFromSqliteBuffer(db, nearbySensors);
-    return { ...out, ...(session ? { session } : {}) };
+    return { ...out, hints };
   }
 
   // 2. Android/MIUI Backup (.bak / .ab)
   if (buf.subarray(0, Math.min(buf.length, 4096)).indexOf(ANDROID_BACKUP_MAGIC) >= 0) {
     const tar = unpackAndroidBackupToTar(buf);
-    const { db, sensors, session } = extractSportFilesFromTar(tar);
+    const { db, sensors, hints } = extractSportFilesFromTar(tar);
     if (!db) throw new UserError('备份包内未找到创高体育数据库 (ygty_mysport.db)。');
     for (const [k, v] of sensors) nearbySensors.set(k, v);
     const out = await extractDatasetFromSqliteBuffer(db, nearbySensors);
-    return { ...out, ...(session ? { session } : {}) };
+    return { ...out, hints };
   }
 
   // 3. Plain TAR archive
   if (ext === '.tar' || (buf.length > 512 && buf.subarray(257, 262).toString('ascii') === 'ustar')) {
-    const { db, sensors, session } = extractSportFilesFromTar(buf);
+    const { db, sensors, hints } = extractSportFilesFromTar(buf);
     if (!db) throw new UserError('TAR 归档内未找到创高体育数据库 (ygty_mysport.db)。');
     for (const [k, v] of sensors) nearbySensors.set(k, v);
     const out = await extractDatasetFromSqliteBuffer(db, nearbySensors);
-    return { ...out, ...(session ? { session } : {}) };
+    return { ...out, hints };
   }
 
   // 4. JSON dataset (starts with '{')
@@ -672,7 +624,7 @@ export async function loadAnySportSource(rawPath: string): Promise<{
   }
 
   // 5. Encrypted WCDB or decrypted SQLite database (.db / ygty_mysport.db)
-  return extractDatasetFromSqliteBuffer(buf, nearbySensors);
+  return { ...await extractDatasetFromSqliteBuffer(buf, nearbySensors), hints: await folderHints(packageDir) };
 }
 
 function resolveAdbBinary(): string {
@@ -725,11 +677,26 @@ function runAdbBuffer(adb: string, args: string[], timeoutMs = 25_000): Promise<
   });
 }
 
+// Live inventory belongs only to the DB read from this serial, never to downloaded archives.
+async function hardwareHints(adb: string, serial: string): Promise<BackupHints | undefined> {
+  const keys = ['ro.product.manufacturer', 'ro.product.model', 'ro.build.version.release', 'ro.build.version.sdk', 'ro.build.id'];
+  try {
+    const values = await Promise.all(keys.map(async key => {
+      const result = await runAdbBuffer(adb, ['-s', serial, 'shell', 'getprop', key], 5000);
+      const value = result.stdout.toString('utf8').trim();
+      if (result.code !== 0 || !/^[a-zA-Z0-9_. -]{1,64}$/.test(value)) throw new Error('property unavailable');
+      return value;
+    }));
+    const [manufacturer, model, androidRelease, sdk, buildId] = values as [string, string, string, string, string];
+    return { model, hardware: { manufacturer, model, androidRelease, sdk, buildId } };
+  } catch { return; }
+}
+
 export async function pullSportDatasetFromPhone(): Promise<{
   dataset: Dataset;
   sensors: Record<string, number[]>;
   sourceHint: string;
-  session?: ExtractedAndroidSession;
+  hints?: BackupHints;
 }> {
   const adb = resolveAdbBinary();
   const devRes = await runAdbBuffer(adb, ['devices'], 8000);
@@ -764,7 +731,7 @@ export async function pullSportDatasetFromPhone(): Promise<{
       ).catch(() => undefined);
       const out = probe?.stdout.toString('utf8') ?? '';
       const hasApp = out.includes('package:');
-      const modelLine = out.split(/\r?\n/).map(x => x.trim()).filter(x => x && !x.startsWith('package:')).pop() ?? s;
+      const modelLine = out.split(/\r?\n/).map(x => x.trim()).filter(x => x && !x.startsWith('package:')).pop() ?? 'Android';
       return { serial: s, hasApp, model: modelLine };
     }),
   );
@@ -776,23 +743,10 @@ export async function pullSportDatasetFromPhone(): Promise<{
 
   try {
     for (const target of rankedSerials) {
+      const deviceDir = join(workDir, randomUUID());
+      await mkdir(deviceDir);
       const serial = target.serial;
       const sArgs = (rest: string[]) => ['-s', serial, ...rest];
-
-      // 顺带拉取外置存储的加速度传感器文件（可读时直接匹配）
-      const phoneSensors = new Map<string, number[]>();
-      const sensorDirLocal = join(workDir, `sensor-${serial}`);
-      await runAdbBuffer(adb, sArgs(['pull', '/sdcard/Android/data/net.crigh.cgsport/files/sensor', sensorDirLocal]), 12_000).catch(() => {});
-      await scanNearbySensorDir(workDir, phoneSensors);
-
-      const mergePhoneSensors = <T extends { dataset: Dataset; sensors: Record<string, number[]> }>(loaded: T): T => {
-        for (const run of loaded.dataset.runs) {
-          if (run.sportId && phoneSensors.has(run.sportId) && !loaded.sensors[String(run.id)]) {
-            loaded.sensors[String(run.id)] = phoneSensors.get(run.sportId)!;
-          }
-        }
-        return loaded;
-      };
 
       // 通道 1A：扫描各品牌本地备份与下载目录 (.bak / .tar / .ab / ygty_mysport.db)
       const findDirect = await runAdbBuffer(
@@ -816,11 +770,11 @@ export async function pullSportDatasetFromPhone(): Promise<{
         );
 
       for (const remoteFile of directCandidates) {
-        const localFile = join(workDir, basename(remoteFile) || 'backup.bak');
+        const localFile = join(deviceDir, basename(remoteFile) || 'backup.bak');
         const pullRes = await runAdbBuffer(adb, sArgs(['pull', remoteFile, localFile]), 45_000);
         if (pullRes.code === 0 && existsSync(localFile)) {
-          const loaded = mergePhoneSensors(await loadAnySportSource(localFile));
-          return { ...loaded, sourceHint: `${target.model} 本地备份` };
+          const loaded = await loadAnySportSource(localFile);
+          return { ...loaded, sourceHint: 'ADB 本地备份' };
         }
       }
 
@@ -850,11 +804,11 @@ export async function pullSportDatasetFromPhone(): Promise<{
 
         // 体积适中的单独备份包 (<300MB) 直接拉取压缩包最快；超大整机备份包则按精确条目名流式提取 .bak
         if (zipSize > 0 && zipSize <= 300_000_000) {
-          const localZip = join(workDir, basename(remoteZip) || 'miui-backup.zip');
+          const localZip = join(deviceDir, basename(remoteZip) || 'miui-backup.zip');
           const pullZip = await runAdbBuffer(adb, sArgs(['pull', remoteZip, localZip]), 60_000);
           if (pullZip.code === 0 && existsSync(localZip)) {
-            const loaded = mergePhoneSensors(await loadAnySportSource(localZip));
-            return { ...loaded, sourceHint: `${target.model} 本地备份包` };
+            const loaded = await loadAnySportSource(localZip);
+            return { ...loaded, sourceHint: 'ADB 本地备份包' };
           }
         }
 
@@ -870,25 +824,40 @@ export async function pullSportDatasetFromPhone(): Promise<{
             const tar = unpackAndroidBackupToTar(streamBak.stdout);
             const extracted = extractSportFilesFromTar(tar);
             if (extracted.db) {
-              for (const [k, v] of extracted.sensors) phoneSensors.set(k, v);
-              const loaded = mergePhoneSensors(await extractDatasetFromSqliteBuffer(extracted.db, phoneSensors));
-              return { ...loaded, sourceHint: `${target.model} 本地备份包`, ...(extracted.session ? { session: extracted.session } : {}) };
+              const loaded = await extractDatasetFromSqliteBuffer(extracted.db, extracted.sensors);
+              return { ...loaded, sourceHint: 'ADB 本地备份包', hints: extracted.hints };
             }
           }
         }
       }
 
       // 通道 2：Root 手机或模拟器直接读取 /data/data/net.crigh.cgsport/databases/ygty_mysport.db
-      for (const cmd of [
-        ['exec-out', 'su', '-c', 'cat /data/data/net.crigh.cgsport/databases/ygty_mysport.db'],
-        ['exec-out', 'cat', '/data/data/net.crigh.cgsport/databases/ygty_mysport.db'],
-        ['exec-out', 'run-as', 'net.crigh.cgsport', 'cat', 'databases/ygty_mysport.db'],
-      ]) {
-        const rootRes = await runAdbBuffer(adb, sArgs(cmd), 15_000).catch(() => undefined);
+      const sandboxReaders: Array<(relPath: string) => string[]> = [
+        relPath => ['exec-out', 'su', '-c', `cat /data/data/net.crigh.cgsport/${relPath}`],
+        relPath => ['exec-out', 'cat', `/data/data/net.crigh.cgsport/${relPath}`],
+        relPath => ['exec-out', 'run-as', 'net.crigh.cgsport', 'cat', relPath],
+      ];
+      for (const makeCmd of sandboxReaders) {
+        const rootRes = await runAdbBuffer(adb, sArgs(makeCmd('databases/ygty_mysport.db')), 15_000).catch(() => undefined);
         if (rootRes && rootRes.stdout.length >= PAGE_SIZE && rootRes.stdout.length % PAGE_SIZE === 0) {
           try {
-            const loaded = mergePhoneSensors(await extractDatasetFromSqliteBuffer(rootRes.stdout, phoneSensors));
-            return { ...loaded, sourceHint: `${target.model} 沙盒直读` };
+            const phoneSensors = new Map<string, number[]>();
+            await runAdbBuffer(adb, sArgs(['pull', '/sdcard/Android/data/net.crigh.cgsport/files/sensor', join(deviceDir, 'sensor')]), 12_000).catch(() => {});
+            await scanNearbySensorDir(deviceDir, phoneSensors);
+            const loaded = await extractDatasetFromSqliteBuffer(rootRes.stdout, phoneSensors);
+            const prefs = new Map<string, string>();
+            for (const key of ['USERINFO', 'SCHOOL', 'HEADER', 'umzid_general_config']) {
+              const r = await runAdbBuffer(adb, sArgs(makeCmd(`shared_prefs/${key}.xml`)), 4000).catch(() => undefined);
+              if (r && r.code === 0 && r.stdout.length > 10 && r.stdout.length <= 65536) prefs.set(key, r.stdout.toString('utf8'));
+            }
+            const cacheRes = await runAdbBuffer(adb, sArgs(makeCmd('files/umeng_it.cache')), 4000).catch(() => undefined);
+            const cacheBuf = cacheRes && cacheRes.code === 0 && cacheRes.stdout.length > 20 && cacheRes.stdout.length <= 65536 ? cacheRes.stdout : undefined;
+            const hw = await hardwareHints(adb, serial);
+            const parsedHints = backupHints(prefs, cacheBuf);
+            const hints: BackupHints | undefined = parsedHints || hw
+              ? { ...parsedHints, ...(hw?.hardware ? { hardware: hw.hardware, model: parsedHints?.model ?? hw.model } : {}) }
+              : undefined;
+            return { ...loaded, hints, sourceHint: hints?.model ? hints.model + ' 本机数据库' : 'ADB 本机数据库' };
           } catch {
             // Not a valid DB buffer; try next method
           }
@@ -897,13 +866,17 @@ export async function pullSportDatasetFromPhone(): Promise<{
 
       // 通道 3：仅对确实装有创高体育的设备发起标准 adb backup
       if (target.hasApp) {
-        const abFile = join(workDir, `phone-${serial}.ab`);
+        const abFile = join(deviceDir, 'phone.ab');
         await runAdbBuffer(adb, sArgs(['backup', '-f', abFile, '-noapk', 'net.crigh.cgsport']), 45_000).catch(() => {});
         if (existsSync(abFile)) {
           const abStat = await stat(abFile);
           if (abStat.size > 512) {
-            const loaded = mergePhoneSensors(await loadAnySportSource(abFile));
-            return { ...loaded, sourceHint: `${target.model} ADB 备份` };
+            const loaded = await loadAnySportSource(abFile);
+            const hw = await hardwareHints(adb, serial);
+            const hints = loaded.hints && hw?.hardware
+              ? { ...loaded.hints, hardware: hw.hardware, model: loaded.hints.model ?? hw.model }
+              : loaded.hints;
+            return { ...loaded, ...(hints ? { hints } : {}), sourceHint: `${target.model} ADB 备份` };
           }
         }
       }

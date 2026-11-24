@@ -22,7 +22,7 @@ import { NativeSigner, MockSigner, ReplaySigner, type Signer } from "./signer.js
 import { NativeEncoder, PassthroughEncoder, type BodyEncoder } from "./encoder.js";
 import { sportsId, saveSports, uploadSensorZip, prejudgment, inSportTime } from "./endpoint.js";
 import { DEFAULT_SESSION_HEADERS, type SessionHeaders } from "./full-submit.js";
-import { androidIdToImei, buildUserAgent, buildV1 } from "./device.js";
+import { buildV1 } from "./device.js";
 import { buildClient } from "./login.js";
 import { isAllowedBaseUrl, type SubmitConfig } from "./submit-handler.js";
 import { auditedRequest } from "./outbound-trace.js";
@@ -153,6 +153,8 @@ export async function handleScheduledSubmit(
     : Date.now();
 
   // 会话头组装（与 full-submit 同规则）
+  if (!config.session?.imei?.trim() || !config.session.userAgent || (config.imei && config.imei !== config.session.imei))
+    return { ok: false, error: "账号设备档案缺失或不匹配。", status: 400 };
   const explicitClient =
     config.session?.client && config.session.client !== DEFAULT_SESSION_HEADERS.client;
   const session: SessionHeaders = { ...DEFAULT_SESSION_HEADERS, ...(config.session ?? {}) };

@@ -10,6 +10,7 @@ import {
 import { deviceConflicts } from "../core/device-identity.js";
 import { fontLabel, languageNames, resolveLanguage, tr, visualStyleLabel } from "../core/i18n.js";
 import {
+  dateTime,
   cachedInformation,
   informationLines,
   informationSummary,
@@ -17,7 +18,6 @@ import {
   schoolLines,
 } from "./information-view.js";
 import { filterFonts, logoFonts, resolveGradientSpeed } from "../render/logo-fonts.js";
-import { deviceHeaders } from "../core/model.js";
 import { maskFixed, maskProxyLabel, maskText } from "../core/privacy.js";
 import { oneShotLines } from "./oneshot-view.js";
 import { termPlanSummary } from "../runtime/scheduling.js";
@@ -165,7 +165,7 @@ export function pageContent({
       const t = state.tasks.find(
         (t) => t.accountId === a.id && !["done", "abandoned"].includes(t.phase),
       );
-      const baseDetail = deviceConflicts(a, state.accounts).length
+      const baseDetail = (a.deviceConflict ?? (deviceConflicts(a, state.accounts).length > 0))
         ? tr(lang, "设备标识冲突", "ID Conflict")
         : t
           ? `${phaseLabel(t, lang)}${t.phase === "queued" ? ` ${clock(t.plannedStartAt ?? 0)}` : waitingPct(t)}`
@@ -309,7 +309,7 @@ export function pageContent({
     line(dim(networkLabel(a, privacy, lang)));
     informationSummary(a, state.settings.termTarget, lang).forEach((s) => line(dim(ext(s))));
     line();
-    const conflict = deviceConflicts(a, state.accounts).length > 0;
+    const conflict = a.deviceConflict ?? (deviceConflicts(a, state.accounts).length > 0);
     getAccountActions(lang).forEach((s, i) =>
       choice(
         i === 0 && conflict
@@ -328,8 +328,15 @@ export function pageContent({
       const shownId = a.school.id ? (privacy ? maskText(a.school.id) : ext(a.school.id)) : "—";
       line(dim(`${tr(lang, "学校", "Campus")} ${shownCampus} · ID ${shownId}`));
     }
-    line(dim(`Android ID ${privacy ? maskFixed(a.device.androidId, 16) : a.device.androidId}`));
-    line(dim(`imei ${privacy ? maskFixed(deviceHeaders(a.device).imei, 16) : deviceHeaders(a.device).imei}`));
+    const limits = cachedInformation(a)?.deviceLimits?.data;
+    const unknown = tr(lang, "未知", "unknown");
+    const sources = { tui: tr(lang, "TUI 固定", "TUI assigned"), manual: tr(lang, "手动设置", "Manual"),
+      portable: tr(lang, "便携备份", "Portable backup"), existing: tr(lang, "原有档案", "Existing profile"),
+      phone: tr(lang, "真机同步", "Phone backup") };
+    line(dim(sources[a.deviceSource ?? "existing"]));
+    line(dim(tr(lang, "每账号设备上限", "Devices/account") + " " + (limits?.devicesPerAccount ?? unknown) +
+      " · " + tr(lang, "每设备账号上限", "Accounts/device") + " " + (limits?.accountsPerDevice ?? unknown) +
+      (limits ? " · " + dateTime(limits.readAt) : "")));
     line(
       dim(
         `${ext(a.device.manufacturer)} ${ext(a.device.model)} · Android ${ext(a.device.androidRelease)} / SDK ${ext(a.device.sdk)}`,

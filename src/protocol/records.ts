@@ -6,7 +6,7 @@
  */
 
 import { NativeSigner } from "./signer.js";
-import { LOGIN_USER_AGENT, buildClient } from "./login.js";
+import { buildClient } from "./login.js";
 import { buildV1 } from "./device.js";
 
 export interface WorkoutRecord {
@@ -38,11 +38,10 @@ export interface FetchRecordsOptions {
   session?: { imei: string; userAgent: string };
 }
 
-const IMEI = "ffffffff-8fbc-fbeb-8fbc-fbeb00000000";
-
 export async function fetchRecords(
   opts: FetchRecordsOptions,
 ): Promise<{ ok: boolean; records: WorkoutRecord[]; error?: string; code?: number; httpStatus?:number }> {
+  if (!opts.session?.imei?.trim() || !opts.session.userAgent) throw new Error("缺少账号设备档案。");
   const base = (opts.baseUrl ?? "https://cgapp.chingo.cn/cgapp-server/").replace(/\/?$/, "/");
   const type = opts.type ?? "1";
   const fetchImpl = opts.fetchImpl ?? fetch;
@@ -54,13 +53,13 @@ export async function fetchRecords(
   const resp = await fetchImpl(base + path, {
     method: "GET",
     headers: {
-      imei: opts.session?.imei ?? IMEI,
-      v1: opts.session ? buildV1() : "",
+      imei: opts.session.imei,
+      v1: buildV1(),
       timestamp: sig.timestamp,
       sign: sig.sign,
       cgAuthorization: opts.token,
-      "User-Agent": opts.session?.userAgent ?? LOGIN_USER_AGENT,
-      client: opts.session ? buildClient(opts.secret) : "",
+      "User-Agent": opts.session.userAgent,
+      client: buildClient(opts.secret),
     },
   });
   const api = (await resp.json()) as {
